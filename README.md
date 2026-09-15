@@ -19,6 +19,15 @@ uv run python -m src.batch path/to/paper.pdf --concurrency 1
 
 `done` 表示输入完整、结构检查通过并成功渲染；它不表示事实已被独立验证。存在关键证据或清晰度问题时报告会标记 `needs_review`。
 
+## Git 记录
+
+当前环境中的 `.git` 目录是只读挂载，因此仓库元数据放在项目内的 `git-data/`。使用下面的命令查看历史和状态：
+
+```bash
+git --git-dir=git-data --work-tree=. log --oneline
+git --git-dir=git-data --work-tree=. status
+```
+
 ## 开发与校准
 
 先用一篇已精读论文运行：
