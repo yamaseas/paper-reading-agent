@@ -9,6 +9,7 @@ repeating a paid model request.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import inspect
 import json
@@ -252,6 +253,34 @@ def _reader_callable() -> Callable[..., Any]:
         function = getattr(reader, name, None)
         if callable(function):
             return function
+    # The production reader intentionally exposes a stateful Reader because
+    # it owns the request budget and visual-refinement session.  Adapt that
+    # class here instead of forcing the CLI to know about SDK details.
+    reader_class = getattr(reader, "Reader", None)
+    if reader_class is not None:
+        def read_with_reader(**kwargs: Any) -> Any:
+            config = kwargs.pop("config", None)
+            event_recorder = kwargs.pop("event_recorder", None)
+            schema_path = kwargs.pop("schema_path", None)
+            prompt_path = kwargs.pop("prompt_path", None)
+            instance = reader_class(
+                config=config,
+                event_recorder=event_recorder,
+                schema_path=schema_path,
+                prompt_path=prompt_path,
+            )
+            read_parameters = {
+                "paper_id": kwargs.get("paper_id"),
+                "pages": kwargs.get("pages", ()),
+                "title": kwargs.get("title", ""),
+                "prompt": kwargs.get("prompt"),
+                "schema": kwargs.get("schema"),
+                "renderer": kwargs.get("renderer"),
+                "original_pages": kwargs.get("original_pages", kwargs.get("pages", ())),
+            }
+            return instance.read(**read_parameters)
+
+        return read_with_reader
     raise BatchError("src.reader exposes none of read_paper/run_reader/run/process_paper/read")
 
 
@@ -264,6 +293,45 @@ def _invoke_reader(
     max_requests: int,
 ) -> Any:
     function = _reader_callable()
+    # Reader page paths in pages.json are relative to the paper workspace;
+    # model input requires absolute paths when the batch is launched elsewhere.
+    page_values: list[Any] = []
+    for page in preparation.get("pages", []):
+        if not isinstance(page, Mapping):
+            page_values.append(page)
+            continue
+        normalised = dict(page)
+        value = normalised.get("path", normalised.get("image_path"))
+        if value is not None and not Path(str(value)).is_absolute():
+            absolute = paper_dir / str(value)
+            normalised["path"] = str(absolute)
+            if normalised.get("image_path") is not None:
+                normalised["image_path"] = str(absolute)
+        page_values.append(normalised)
+
+    def crop_renderer(*, pdf_page: int, crop: Any, dpi: float, source_page: Any = None) -> Any:
+        from .preprocess import render_crop
+
+        crop_dir = run_dir / "crops"
+        crop_dir.mkdir(parents=True, exist_ok=True)
+        index = len(list(crop_dir.glob("crop-*.png"))) + 1
+        target = crop_dir / f"crop-{index:02d}.png"
+        source_pdf = preparation.get("original_pdf", paper_dir / "original.pdf")
+        return render_crop(
+            source_pdf,
+            pdf_page,
+            crop,
+            target,
+            dpi=dpi,
+            image_format="png",
+            max_pixels=_deep_get(config, "input", "image_max_pixels", default=None),
+        )
+    reader_config = copy.deepcopy(dict(config))
+    batch_config = reader_config.setdefault("batch", {})
+    if isinstance(batch_config, Mapping):
+        batch_config = dict(batch_config)
+        batch_config["max_requests_per_paper"] = max(1, int(max_requests))
+        reader_config["batch"] = batch_config
     kwargs = {
         "pdf_path": pdf_path,
         "paper_path": pdf_path,
@@ -275,13 +343,26 @@ def _invoke_reader(
         "preparation": preparation,
         "preprocess_result": preparation,
         "prepared": preparation,
-        "pages": preparation.get("pages", []),
+        "pages": page_values,
+        "paper_pages": page_values,
+        "title": "",
+        "renderer": crop_renderer,
+        "original_pages": page_values,
+        "event_recorder": None,
+        "schema_path": Path(__file__).resolve().parents[1] / "schemas" / "report.schema.json",
+        "prompt_path": Path(__file__).resolve().parents[1] / "prompts" / "reader.md",
         "pages_json": preparation.get("pages_path", paper_dir / "pages.json"),
-        "config": config,
+        "config": reader_config,
         "max_requests": max_requests,
         "max_requests_per_paper": max_requests,
         "paper_id": preparation.get("paper_id", paper_dir.name),
     }
+    try:
+        from .reader import JsonlEventRecorder
+
+        kwargs["event_recorder"] = JsonlEventRecorder(run_dir / "events.jsonl")
+    except (ImportError, AttributeError):
+        pass
     return _call_with_supported_kwargs(function, kwargs)
 
 
@@ -300,7 +381,14 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
             candidate = value
     elif hasattr(value, "report"):
         candidate = getattr(value, "report")
-        metadata = getattr(value, "metadata", {}) if isinstance(getattr(value, "metadata", {}), Mapping) else {}
+        raw_metadata = getattr(value, "metadata", {})
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        calls = getattr(value, "calls", None)
+        if isinstance(calls, Sequence):
+            metadata["requests_made"] = len(calls)
+        unresolved = getattr(value, "unresolved_items", None)
+        if isinstance(unresolved, Sequence) and not isinstance(unresolved, (str, bytes)):
+            metadata["unresolved_items"] = list(unresolved)
     elif isinstance(value, (str, os.PathLike)):
         candidate = _load_json(Path(value))
     if isinstance(candidate, Mapping) and REPORT_KEYS.intersection(candidate.keys()):
@@ -688,4 +776,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-
