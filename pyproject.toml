@@ -1,0 +1,16 @@
+[project]
+name = "paper-reading-agent"
+version = "0.1.0"
+description = "A Qwen3.8-Flash based paper reading pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.50.0",
+  "PyMuPDF>=1.24.0",
+  "Pillow>=10.0.0",
+  "PyYAML>=6.0.0",
+  "jsonschema>=4.20.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
