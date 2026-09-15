@@ -11,6 +11,15 @@ export DASHSCOPE_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 uv run python -m src.batch path/to/paper.pdf --concurrency 1
 ```
 
+如果当前工具进程无法继承终端环境，也可以在项目根目录创建未纳入 Git 的 `.env`：
+
+```dotenv
+DASHSCOPE_API_KEY=你的阿里云 DashScope API Key
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+程序只读取本地 `.env`，不会把内容写入日志或报告。
+
 也可以把当天的多篇 PDF 放入 `inbox/YYYY-MM-DD/`，直接把目录传给 batch。API key 只从环境变量读取，不写入配置或日志。
 
 ## 产物

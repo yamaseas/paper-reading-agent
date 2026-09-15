@@ -31,6 +31,41 @@ DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "report.schema.json"
 
 
+def load_env_file(path: str | os.PathLike[str] | None = None) -> Path | None:
+    """Load a small project-local ``.env`` file without overriding exports.
+
+    A dependency-free loader keeps API keys out of ``config.yaml`` while
+    making the CLI usable when a parent shell does not propagate its
+    environment into the tool process.  Existing environment variables win.
+    Only simple ``KEY=value`` and ``export KEY=value`` lines are accepted.
+    """
+
+    candidate = Path(path) if path is not None else Path.cwd() / ".env"
+    if not candidate.is_file():
+        return None
+    try:
+        lines = candidate.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ReaderConfigError(f"Could not read environment file {candidate}: {exc}") from exc
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        name, raw_value = line.split("=", 1)
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name in os.environ:
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[name] = value
+    return candidate
+
+
 class ReaderError(RuntimeError):
     """Base exception for errors raised by this module."""
 
@@ -107,6 +142,7 @@ class ReaderConfig:
         configuration rather than a direct passthrough of provider options.
         """
 
+        load_env_file()
         value = value or {}
         model_cfg = _mapping(value.get("model"))
         input_cfg = _mapping(value.get("input"))
@@ -170,6 +206,7 @@ class ReaderConfig:
         config_path = Path(path)
         if not config_path.exists():
             raise ReaderConfigError(f"Configuration file does not exist: {config_path}")
+        load_env_file(config_path.parent / ".env")
         try:
             with config_path.open("r", encoding="utf-8") as stream:
                 loaded = yaml.safe_load(stream) or {}
@@ -1111,6 +1148,7 @@ __all__ = [
     "ReaderInputError",
     "ReaderResponseError",
     "image_data_uri",
+    "load_env_file",
     "normalize_page",
     "normalize_pages",
     "parse_json_object",

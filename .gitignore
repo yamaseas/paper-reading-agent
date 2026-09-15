@@ -3,6 +3,7 @@ git-data/
 *.py[cod]
 .pytest_cache/
 .venv/
+.env
 inbox/
 workspace/
 output/
