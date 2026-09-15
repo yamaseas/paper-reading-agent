@@ -71,6 +71,7 @@ REFINED_UNRESOLVED_PREFIX = "补看后仍未解决："
 PATCH_REJECTED_PREFIX = "补看补丁未应用："
 DANGLING_EVIDENCE_PREFIX = "证据引用已移除："
 DANGLING_METHOD_PREFIX = "未落地的方法项已省略："
+DUPLICATE_EVIDENCE_PREFIX = "重复证据 ID："
 # Diagram-stage bookkeeping.  These are computed once from the final diagrams,
 # so -- unlike DERIVED_PREFIXES -- they are never recomputed and must be
 # carried like any other unresolved item.
@@ -84,6 +85,7 @@ DERIVED_PREFIXES = (
     REFINED_UNRESOLVED_PREFIX,
     DANGLING_EVIDENCE_PREFIX,
     DANGLING_METHOD_PREFIX,
+    DUPLICATE_EVIDENCE_PREFIX,
 )
 
 # One system message for every call this module makes.  The reading call and
@@ -243,6 +245,50 @@ class JsonlEventRecorder:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(dict(event), ensure_ascii=False, sort_keys=True) + "\n")
             stream.flush()
+
+    def record_raw_response(
+        self,
+        *,
+        call_type: str,
+        request_id: str,
+        response: Any,
+        status: str = "received",
+    ) -> str:
+        """Persist a provider response before any JSON parsing can discard it.
+
+        The normal successful path already copies responses into ``raw/`` when
+        the Reader result is extracted.  This hook also covers malformed or
+        schema-invalid responses, which are the artifacts needed to diagnose a
+        failed run.  The response is stored locally with the event log; API
+        credentials and image bytes are not part of the SDK response object.
+        """
+
+        raw_dir = self.path.parent / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        payload: Any = response
+        if hasattr(response, "model_dump"):
+            try:
+                payload = response.model_dump(mode="json")
+            except Exception:  # noqa: BLE001 - SDK versions differ
+                payload = response.model_dump()
+        elif hasattr(response, "to_dict"):
+            payload = response.to_dict()
+        elif not isinstance(response, (Mapping, list, str, int, float, bool, type(None))):
+            payload = {"repr": repr(response)}
+        target = raw_dir / f"{call_type}-{request_id}.json"
+        record = {
+            "call_type": call_type,
+            "request_id": request_id,
+            "status": status,
+            "message_content": _message_content(response),
+            "response": payload,
+        }
+        try:
+            text = json.dumps(record, ensure_ascii=False, sort_keys=True, default=repr)
+        except (TypeError, ValueError):
+            text = json.dumps({"repr": repr(record)}, ensure_ascii=False)
+        target.write_text(text + "\n", encoding="utf-8")
+        return str(target)
 
     # ``record_event`` is useful for callers which use that naming convention.
     record_event = record
@@ -1200,6 +1246,11 @@ class Reader:
                         "received_at": _now(),
                     }
                 )
+                self._record_raw_response(
+                    call_type=call_type,
+                    request_id=request_id,
+                    response=response,
+                )
                 payload = self._parse_response(response, schema)
                 if preprocess is not None:
                     preprocess(payload)
@@ -1221,10 +1272,16 @@ class Reader:
                             "errors": remaining_errors[:20],
                         }
                     )
-                    raise ReaderResponseError(
+                    error = ReaderResponseError(
                         "Model response still violates the schema after format repair: "
                         + "; ".join(remaining_errors[:5])
                     )
+                    # A complete report was produced, but its structure was
+                    # not recoverable by the text-only repair.  A fresh main
+                    # read can produce a different valid shape; later stages
+                    # should still fail locally instead of re-reading images.
+                    error.retryable_with_images = call_type == "read"
+                    raise error
                 if postprocess is not None:
                     postprocess(payload)
                 # Identity, not a counter: a repair round that ran but whose
@@ -1405,6 +1462,17 @@ class Reader:
         if repaired is None:
             return payload
         if schema:
+            repaired, wrapper = _unwrap_report_wrapper(repaired, schema)
+            if wrapper:
+                self._emit(
+                    {
+                        "event": "schema_wrapper_unwrapped",
+                        "call_type": call_type,
+                        "paper_id": paper_id,
+                        "wrapper": wrapper,
+                        "source": "repair",
+                    }
+                )
             repair_fixes = normalize_report_schema_shape(repaired, schema)
             if repair_fixes:
                 self._emit(
@@ -1464,6 +1532,17 @@ class Reader:
         if repaired is None:
             return None
         if schema:
+            repaired, wrapper = _unwrap_report_wrapper(repaired, schema)
+            if wrapper:
+                self._emit(
+                    {
+                        "event": "schema_wrapper_unwrapped",
+                        "call_type": call_type,
+                        "paper_id": paper_id,
+                        "wrapper": wrapper,
+                        "source": "unparsable_repair",
+                    }
+                )
             repair_fixes = normalize_report_schema_shape(repaired, schema)
             if repair_fixes:
                 self._emit(
@@ -1592,6 +1671,11 @@ class Reader:
                     "duration_s": round(time.monotonic() - started, 3),
                     "received_at": _now(),
                 }
+            )
+            self._record_raw_response(
+                call_type="format_repair",
+                request_id=request_id,
+                response=response,
             )
             content = _message_content(response)
             if content is None or not str(content).strip():
@@ -1884,8 +1968,7 @@ class Reader:
             error.raw_content = str(content)
             error.repairable = True
             raise error from exc
-        if "report" in parsed and isinstance(parsed["report"], Mapping) and len(parsed) == 1:
-            parsed = dict(parsed["report"])
+        parsed, _wrapper = _unwrap_report_wrapper(parsed, schema)
         if _carries_no_report(parsed, schema):
             # A JSON object that holds nothing report-shaped is the same
             # accident as `[]`, and the schema repair would write the report
@@ -1913,6 +1996,37 @@ class Reader:
             # successful model response into an apparent reading failure.
             # The batch layer can also monitor stderr if it needs strict logs.
             _ = exc
+
+    def _record_raw_response(
+        self, *, call_type: str, request_id: str, response: Any, status: str = "received"
+    ) -> None:
+        """Ask a durable event recorder to save the response body if supported."""
+
+        recorder = self.event_recorder
+        save = getattr(recorder, "record_raw_response", None)
+        if not callable(save):
+            return
+        try:
+            path = save(
+                call_type=call_type,
+                request_id=request_id,
+                response=response,
+                status=status,
+            )
+            # The path is deterministic from the run's raw directory, call
+            # type and request id.  Avoid adding a second event for every
+            # successful response; existing event consumers rely on the
+            # request lifecycle sequence.
+            _ = path
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not break a call
+            self._emit(
+                {
+                    "event": "raw_response_save_failed",
+                    "call_type": call_type,
+                    "request_id": request_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
 
 def normalize_page(
@@ -1985,6 +2099,37 @@ def _strip_fence(value: str) -> str:
         text = re.sub(r"\s*```$", "", text, count=1)
         text = text.strip()
     return text
+
+
+_REPORT_WRAPPER_KEYS = ("report", "report_json", "fixed_json", "result")
+
+
+def _unwrap_report_wrapper(
+    value: Mapping[str, Any], schema: Mapping[str, Any] | None = None
+) -> tuple[dict[str, Any], str | None]:
+    """Extract a report object wrapped by a provider or repair prompt.
+
+    Qwen sometimes answers a repair request with ``{"fixed_json": {...}}``.
+    The wrapper is mechanical and safe to remove when the nested object has
+    report-shaped keys and the outer object has no competing required fields.
+    This must happen before ``additionalProperties: false`` cleanup, otherwise
+    the useful nested report is deleted as an unknown field.
+    """
+
+    current = dict(value)
+    required = schema.get("required") if isinstance(schema, Mapping) else None
+    required_keys = {str(item) for item in required} if isinstance(required, Sequence) else set()
+    for key in _REPORT_WRAPPER_KEYS:
+        nested = current.get(key)
+        if not isinstance(nested, Mapping):
+            continue
+        outer_keys = set(current) - {key}
+        nested_has_report_shape = bool(set(nested) & required_keys) if required_keys else bool(nested)
+        outer_has_required_fields = bool(outer_keys & required_keys)
+        if not nested_has_report_shape or outer_has_required_fields:
+            continue
+        return dict(nested), key
+    return current, None
 
 
 def _no_report_error(message: str) -> ReaderResponseError:
@@ -3823,6 +3968,7 @@ def reconcile_cross_references(report: MutableMapping[str, Any]) -> None:
     report written by an older run.
     """
 
+    _merge_duplicate_evidence(report)
     known_evidence = {
         str(entry.get("id"))
         for entry in _mappings(report.get("evidence"))
@@ -3912,6 +4058,79 @@ def reconcile_cross_references(report: MutableMapping[str, Any]) -> None:
             grounded_steps.append(step)
         method["steps"] = grounded_steps
     _append_unresolved_to_report(report, method_problems)
+
+
+def _merge_duplicate_evidence(report: MutableMapping[str, Any]) -> None:
+    """Make repeated model evidence IDs deterministic before reference checks.
+
+    Models occasionally emit two evidence entries for the same text page with
+    one ID.  Treating that harmless repetition as a fatal report error loses a
+    complete reading.  When the source identity is the same, merge the textual
+    descriptors into the first entry.  If the same ID points at different
+    sources, keep both entries under a deterministic alias and flag the
+    ambiguity for review; existing references continue to resolve to the first
+    entry rather than being guessed.
+    """
+
+    evidence = report.get("evidence")
+    if not isinstance(evidence, list):
+        return
+    seen: dict[str, MutableMapping[str, Any]] = {}
+    identity_by_id: dict[str, tuple[Any, ...] | None] = {}
+    aliases: dict[str, int] = {}
+    merged: list[Any] = []
+    problems: list[str] = []
+
+    def identity(item: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        values = tuple(item.get(key) for key in ("source_type", "pdf_page", "source_id"))
+        return values if all(value not in (None, "") for value in values) else None
+
+    for item in evidence:
+        if not isinstance(item, MutableMapping):
+            merged.append(item)
+            continue
+        evidence_id = item.get("id")
+        if not isinstance(evidence_id, str) or not evidence_id.strip() or evidence_id not in seen:
+            merged.append(item)
+            if isinstance(evidence_id, str) and evidence_id.strip():
+                seen[evidence_id] = item
+                identity_by_id[evidence_id] = identity(item)
+            continue
+
+        first = seen[evidence_id]
+        current_identity = identity(item)
+        if identity_by_id[evidence_id] is not None and current_identity == identity_by_id[evidence_id]:
+            for field_name in _EVIDENCE_FIELDS:
+                current = item.get(field_name)
+                previous = first.get(field_name)
+                if not isinstance(current, str) or not current.strip() or current == previous:
+                    continue
+                if not isinstance(previous, str) or not previous.strip():
+                    first[field_name] = current
+                    continue
+                separator = "\n\n" if field_name == "quote" else "；"
+                if current not in previous.split(separator):
+                    first[field_name] = f"{previous}{separator}{current}"
+            continue
+
+        aliases[evidence_id] = aliases.get(evidence_id, 0) + 1
+        alias = f"{evidence_id}__dup{aliases[evidence_id]}"
+        while alias in seen:
+            aliases[evidence_id] += 1
+            alias = f"{evidence_id}__dup{aliases[evidence_id]}"
+        renamed = dict(item)
+        renamed["id"] = alias
+        merged.append(renamed)
+        seen[alias] = renamed
+        identity_by_id[alias] = current_identity
+        problems.append(
+            f"{DUPLICATE_EVIDENCE_PREFIX}{evidence_id!r} 指向不同来源，已将冲突条目标记为 "
+            f"{alias!r}；原引用保留首条"
+        )
+
+    if merged != evidence:
+        report["evidence"] = merged
+    _append_unresolved_to_report(report, problems)
 
 
 def _call_renderer(

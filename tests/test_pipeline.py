@@ -32,6 +32,7 @@ from src.reader import (
     ReaderConfig,
     ReaderConfigError,
     ReaderResponseError,
+    JsonlEventRecorder,
     normalize_report_schema_shape,
     reconcile_cross_references,
     schema_errors,
@@ -572,6 +573,43 @@ def test_schema_violation_is_repaired_without_images(tmp_path: Path) -> None:
     assert all(item.get("type") == "text" for item in fake.calls[1]["messages"][1]["content"])
 
 
+def test_fixed_json_repair_wrapper_is_unwrapped_before_shape_cleanup(tmp_path: Path) -> None:
+    """A repair wrapper must not be deleted as an unknown root field."""
+
+    broken = sample_report()
+    del broken["method"]
+    fake = FakeClient([broken, {"fixed_json": sample_report()}])
+    reader = Reader(ReaderConfig.from_mapping({"model": {"name": "m"}}), client=fake)
+
+    result = reader.read("demo", page_images(tmp_path))
+
+    assert result.report["method"]["nodes"]
+    assert len(fake.calls) == 2
+
+
+def test_failed_schema_response_is_saved_before_parse_failure(tmp_path: Path) -> None:
+    """The response needed to diagnose a failed repair remains on disk."""
+
+    broken = sample_report()
+    del broken["method"]
+    still_broken = sample_report()
+    del still_broken["claims"]
+    recorder = JsonlEventRecorder(tmp_path / "events.jsonl")
+    fake = FakeClient([broken, still_broken])
+    reader = Reader(
+        ReaderConfig.from_mapping({"model": {"name": "m"}}),
+        client=fake,
+        event_recorder=recorder,
+    )
+
+    with pytest.raises(ReaderResponseError):
+        reader.read("demo", page_images(tmp_path))
+
+    raw = sorted((tmp_path / "raw").glob("*.json"))
+    assert len(raw) == 2
+    assert any("fixed_json" not in item.read_text(encoding="utf-8") for item in raw)
+
+
 def test_repair_budget_is_respected(tmp_path: Path) -> None:
     broken = sample_report()
     del broken["method"]
@@ -746,6 +784,36 @@ def test_dangling_cross_references_are_omitted_and_recorded() -> None:
     assert validate_report(report, pages=pages_manifest()).valid
 
 
+def test_duplicate_evidence_from_the_same_source_is_merged() -> None:
+    report = sample_report()
+    duplicate = dict(report["evidence"][0])
+    duplicate.update({"section": "3.1 Detail", "quote": "The same source adds detail."})
+    report["evidence"].append(duplicate)
+
+    reconcile_cross_references(report)
+
+    entries = [item for item in report["evidence"] if item["id"] == "E1"]
+    assert len(entries) == 1
+    assert "The same source adds detail." in entries[0]["quote"]
+    assert not any(item.startswith("重复证据 ID：") for item in report["unresolved_items"])
+    assert validate_report(report, pages=pages_manifest()).valid
+
+
+def test_duplicate_evidence_from_different_sources_is_aliased_for_review() -> None:
+    report = sample_report()
+    duplicate = dict(report["evidence"][0])
+    duplicate.update({"pdf_page": 2, "source_id": "page-002-text"})
+    report["evidence"].append(duplicate)
+
+    reconcile_cross_references(report)
+
+    ids = [item["id"] for item in report["evidence"]]
+    assert len(ids) == len(set(ids))
+    assert "E1__dup1" in ids
+    assert any(item.startswith("重复证据 ID：") for item in report["unresolved_items"])
+    assert validate_report(report, pages=pages_manifest()).valid
+
+
 def test_schema_errors_helper_returns_readable_paths() -> None:
     schema = json.loads((PROJECT / "schemas" / "report.schema.json").read_text())
     broken = sample_report()
@@ -890,10 +958,11 @@ def test_schema_repair_that_drops_method_content_is_rejected(tmp_path: Path) -> 
     fake = FakeClient([broken, regressed])
     reader = Reader(ReaderConfig.from_mapping({"model": {"name": "m"}}), client=fake)
 
-    with pytest.raises(ReaderResponseError, match="still violates the schema"):
+    with pytest.raises(ReaderResponseError, match="still violates the schema") as excinfo:
         reader.read("demo", page_images(tmp_path))
 
     assert len(fake.calls) == 2, "a rejected repair must not continue to later stages"
+    assert excinfo.value.retryable_with_images is True
 
 
 # --- batch behaviour -----------------------------------------------------
@@ -903,6 +972,12 @@ def test_response_errors_are_not_retried_by_the_batch() -> None:
     assert _retryable(ReaderResponseError("Model response is not valid JSON")) is False
     assert _retryable(TimeoutError("read timed out")) is True
     assert _retryable(RuntimeError("429 rate limited")) is True
+
+
+def test_schema_rejection_can_opt_into_a_fresh_main_read() -> None:
+    error = ReaderResponseError("Model response still violates the schema")
+    error.retryable_with_images = True
+    assert _retryable(error) is True
 
 
 def test_a_substance_free_response_is_retried_by_the_batch() -> None:
@@ -1511,6 +1586,35 @@ def test_the_batch_retries_a_substance_free_response_with_the_text(tmp_path: Pat
     assert all(event["pages"] == [] and event["images"] == [] for event in read_starts)
     assert all(event["available_pages"] == [1, 2] for event in read_starts)
     assert all(event["text_chars"] > 0 for event in read_starts)
+
+
+def test_the_batch_retries_an_unrecoverable_main_schema_response(tmp_path: Path) -> None:
+    """An exhausted main-report repair gets one fresh read within the budget."""
+
+    pdf = make_pdf(tmp_path / "paper.pdf", pages=2)
+    broken = sample_report()
+    del broken["method"]
+    still_broken = sample_report()
+    del still_broken["claims"]
+    report = sample_report()
+    report["paper_id"] = "paper"
+    fake = FakeClient([broken, still_broken, report, diagram_payload()])
+    original = Reader._make_client
+    Reader._make_client = lambda self: fake  # type: ignore[assignment]
+    try:
+        results = run_batch(pdf, batch_options(tmp_path))
+    finally:
+        Reader._make_client = original  # type: ignore[assignment]
+
+    result = results[0]
+    assert result.error is None, result.error
+    assert result.status in {"done", "needs_review"}
+    assert len(fake.calls) == 4, "the failed repair should be followed by one new read"
+    events = _events(result)
+    failures = [event for event in events if event.get("kind") == "reader_failed"]
+    assert len(failures) == 1
+    assert failures[0]["retryable"] is True
+    assert any(event.get("kind") == "reader_succeeded" for event in events)
 
 
 def _events(result) -> list[dict]:

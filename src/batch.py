@@ -543,7 +543,7 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
     candidate: Any = value
     if isinstance(value, Mapping):
         metadata = value
-        for key in ("report", "report_json", "result"):
+        for key in ("report", "report_json", "fixed_json", "result"):
             if isinstance(value.get(key), Mapping):
                 candidate = value[key]
                 break
@@ -711,11 +711,12 @@ def _validate_report(
 def _retryable(error: BaseException) -> bool:
     """Decide whether re-sending the whole paper request could help.
 
-    A malformed or truncated model response is deliberately excluded: the same
-    prompt with the same images reproduces the same failure, and each attempt
-    pays for every page image again.  The reader already repairs malformed JSON
-    with a text-only call, so a response error that reaches this layer is not
-    worth a full re-read.
+    Most malformed responses are deliberately excluded: the same prompt with
+    the same images reproduces the same failure, and each attempt pays for
+    every page image again.  The reader repairs malformed JSON with a text-only
+    call.  A schema rejection that explicitly opts into ``retryable_with_images``
+    is different: it means the text-only repair ran but could not recover a
+    complete main report, so a fresh main read may still help.
 
     The exception is a response with no report content at all (`[]` after a long
     reasoning pass, or an empty message).  Nothing can be reformatted there, and
