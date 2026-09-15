@@ -5,12 +5,10 @@
 ## 快速开始
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 export DASHSCOPE_API_KEY='...'
 export DASHSCOPE_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
-python3 -m src.batch path/to/paper.pdf --concurrency 1
+uv run python -m src.batch path/to/paper.pdf --concurrency 1
 ```
 
 也可以把当天的多篇 PDF 放入 `inbox/YYYY-MM-DD/`，直接把目录传给 batch。API key 只从环境变量读取，不写入配置或日志。
@@ -26,7 +24,7 @@ python3 -m src.batch path/to/paper.pdf --concurrency 1
 先用一篇已精读论文运行：
 
 ```bash
-python3 -m src.batch paper.pdf --concurrency 1
+uv run python -m src.batch paper.pdf --concurrency 1
 ```
 
 然后用 3–5 篇论文建立人工参考答案，比较全页图片和带页码文本加关键图片的输入，记录严重错误、证据支持率、耗时和实际 token 用量。Verifier 默认关闭，只有校准显示有稳定净收益时才加入。

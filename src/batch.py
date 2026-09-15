@@ -331,6 +331,11 @@ def _invoke_reader(
     if isinstance(batch_config, Mapping):
         batch_config = dict(batch_config)
         batch_config["max_requests_per_paper"] = max(1, int(max_requests))
+        # Batch owns retries so that the durable job counter and retry policy
+        # have one source of truth.  Direct Reader users still get the
+        # configured per-call retries; nesting both policies could exceed the
+        # per-paper request budget without the batch layer knowing it.
+        batch_config["max_retries_per_call"] = 0
         reader_config["batch"] = batch_config
     kwargs = {
         "pdf_path": pdf_path,
@@ -386,9 +391,32 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
         calls = getattr(value, "calls", None)
         if isinstance(calls, Sequence):
             metadata["requests_made"] = len(calls)
+            metadata["calls"] = [
+                call.as_dict() if hasattr(call, "as_dict") else call
+                for call in calls
+            ]
         unresolved = getattr(value, "unresolved_items", None)
         if isinstance(unresolved, Sequence) and not isinstance(unresolved, (str, bytes)):
             metadata["unresolved_items"] = list(unresolved)
+        raw_responses = getattr(value, "raw_responses", None)
+        if isinstance(raw_responses, Sequence):
+            raw_dir = run_dir / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            for index, response in enumerate(raw_responses, start=1):
+                payload: Any = response
+                if hasattr(response, "model_dump"):
+                    try:
+                        payload = response.model_dump(mode="json")
+                    except Exception:
+                        payload = response.model_dump()
+                elif hasattr(response, "to_dict"):
+                    payload = response.to_dict()
+                elif not isinstance(response, (Mapping, list, str, int, float, bool, type(None))):
+                    payload = {"repr": repr(response)}
+                try:
+                    _atomic_json(raw_dir / f"response-{index:02d}.json", payload)
+                except (TypeError, ValueError):
+                    _atomic_json(raw_dir / f"response-{index:02d}.json", {"repr": repr(response)})
     elif isinstance(value, (str, os.PathLike)):
         candidate = _load_json(Path(value))
     if isinstance(candidate, Mapping) and REPORT_KEYS.intersection(candidate.keys()):
@@ -401,7 +429,9 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
     raise BatchError("reader did not return a report object or create run/report.json")
 
 
-def _validate_report(report: Mapping[str, Any], config_path: Path) -> list[str]:
+def _validate_report(
+    report: Mapping[str, Any], config_path: Path, pages_path: Path | None = None
+) -> list[str]:
     """Use src.validate when present, with a schema-only fallback."""
 
     try:
@@ -418,6 +448,7 @@ def _validate_report(report: Mapping[str, Any], config_path: Path) -> list[str]:
                 "data": report,
                 "report_path": None,
                 "schema_path": config_path.parent / "schemas" / "report.schema.json",
+                "pages": pages_path,
             }
             try:
                 result = _call_with_supported_kwargs(function, kwargs)
@@ -430,6 +461,14 @@ def _validate_report(report: Mapping[str, Any], config_path: Path) -> list[str]:
                 if not errors and result.get("valid") is True:
                     return []
                 return [str(item) for item in (errors if isinstance(errors, list) else [errors])]
+            # ``src.validate.validate_report`` returns a ValidationResult
+            # object so callers can inspect warnings and schema/semantic
+            # status.  Treat its error collection as authoritative here.
+            if hasattr(result, "valid"):
+                if bool(getattr(result, "valid")):
+                    return []
+                errors = getattr(result, "errors", [])
+                return [str(item) for item in errors]
             if isinstance(result, (list, tuple, set)):
                 return [str(item) for item in result]
             if isinstance(result, str):
@@ -603,7 +642,7 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
         report = _load_json(report_path)
         if not isinstance(report, Mapping):
             raise BatchError("report.json root must be an object")
-        issues = _validate_report(report, options.config_path)
+        issues = _validate_report(report, options.config_path, paper_dir / "pages.json")
         if issues:
             _update_job(job_path, job, status="failed", phase="validate", validation_errors=issues, error="report validation failed")
             _event(run_dir, "validation_failed", errors=issues)
