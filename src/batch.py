@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -24,11 +25,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from uuid import uuid4
 
 from .render_report import render_report
 
 
 DATE_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
+# ``--date`` accepts the plain date plus an optional suffix, so a re-run of the
+# same day can be written next to the first one (``2026-09-15-v5``) instead of
+# overwriting it.  The suffix is only ever a directory label: nothing parses a
+# batch date back out of the output tree, so ``DATE_RE`` stays strict where a
+# date really is a date (detecting a dated input directory).
+DATE_LABEL_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}(-[A-Za-z0-9._]+)*$")
 # The page ceiling applied when ``input.max_pages`` is absent.  Long conference
 # papers with appendices run past 40 pages; 80 leaves room for those while
 # still stopping a thesis-sized PDF before its images are rendered and sent.
@@ -42,14 +50,19 @@ REPORT_KEYS = {
     "related_work",
     "method",
     "experiments",
-    "authors_limitations",
+    "future_work",
     "reader_analysis",
     "full_summary",
+    "reading_guide",
     "claims",
     "evidence",
     "visual_requests",
     "unresolved_items",
 }
+# ``diagrams`` is deliberately not in the set above: it is optional in the
+# schema and is added by the diagram stage after the report is written, so a
+# report without it is still a complete report.
+INPUT_MODES = ("hybrid_text_visual", "full_page_images")
 
 
 class BatchError(RuntimeError):
@@ -58,6 +71,10 @@ class BatchError(RuntimeError):
 
 class BatchPermanentError(BatchError):
     """An error that a retry cannot fix, such as an exhausted request budget."""
+
+
+class BatchInterruptedError(BatchError):
+    """Internal signal used to persist a user-requested interruption."""
 
 
 @dataclass(frozen=True)
@@ -71,6 +88,7 @@ class BatchOptions:
     resume: bool
     retry_backoff_s: float
     batch_date: str
+    force_reread: bool = False
 
 
 @dataclass
@@ -171,18 +189,46 @@ def _stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_default)
 
 
-def _config_fingerprint(config: Mapping[str, Any], config_path: Path) -> str:
+def _fingerprint_file(digest: Any, path: Path, label: str) -> None:
+    """Hash one labelled file so equal byte concatenations cannot collide."""
+
+    if not path.exists():
+        return
+    digest.update(label.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+
+
+def _config_fingerprint(
+    config: Mapping[str, Any],
+    config_path: Path,
+    *,
+    runtime_root: Path | None = None,
+) -> str:
+    """Identify every input that can change a run's model-visible result.
+
+    The old fingerprint covered configuration, schema and prompts but not the
+    executing pipeline.  Consequently ``--resume`` could reuse a failed or
+    stale run after a code fix.  Include the Python sources and dependency
+    lock now so a retry after changing the reader gets a fresh run directory.
+    """
+
     digest = hashlib.sha256()
     digest.update(_stable_json(config).encode("utf-8"))
-    if config_path.exists():
-        digest.update(config_path.read_bytes())
+    _fingerprint_file(digest, config_path, "config.yaml")
     schema_path = config_path.parent / "schemas" / "report.schema.json"
-    if schema_path.exists():
-        digest.update(schema_path.read_bytes())
-    for prompt in ("reader.md", "refine.md"):
+    _fingerprint_file(digest, schema_path, "schemas/report.schema.json")
+    for prompt in ("reader.md", "refine.md", "diagram.md"):
         prompt_path = config_path.parent / "prompts" / prompt
-        if prompt_path.exists():
-            digest.update(prompt_path.read_bytes())
+        _fingerprint_file(digest, prompt_path, f"prompts/{prompt}")
+
+    project_root = runtime_root or Path(__file__).resolve().parents[1]
+    source_dir = project_root / "src"
+    for source_path in sorted(source_dir.glob("*.py")):
+        _fingerprint_file(digest, source_path, f"src/{source_path.name}")
+    for dependency_file in ("pyproject.toml", "uv.lock"):
+        _fingerprint_file(digest, project_root / dependency_file, dependency_file)
     return digest.hexdigest()
 
 
@@ -272,26 +318,113 @@ def _reader_callable() -> Callable[..., Any]:
             schema_path = kwargs.pop("schema_path", None)
             prompt_path = kwargs.pop("prompt_path", None)
             refine_prompt_path = kwargs.pop("refine_prompt_path", None)
-            instance = reader_class(
-                config=config,
-                event_recorder=event_recorder,
-                schema_path=schema_path,
-                prompt_path=prompt_path,
-                refine_prompt_path=refine_prompt_path,
+            instance = _call_with_supported_kwargs(
+                reader_class,
+                {
+                    "config": config,
+                    "event_recorder": event_recorder,
+                    "schema_path": schema_path,
+                    "prompt_path": prompt_path,
+                    "refine_prompt_path": refine_prompt_path,
+                    "diagram_prompt_path": kwargs.get("diagram_prompt_path"),
+                },
             )
             read_parameters = {
                 "paper_id": kwargs.get("paper_id"),
                 "pages": kwargs.get("pages", ()),
+                "text": kwargs.get("text"),
+                "metadata": kwargs.get("metadata"),
                 "title": kwargs.get("title", ""),
                 "prompt": kwargs.get("prompt"),
                 "schema": kwargs.get("schema"),
                 "renderer": kwargs.get("renderer"),
                 "original_pages": kwargs.get("original_pages", kwargs.get("pages", ())),
             }
-            return instance.read(**read_parameters)
+            result = instance.read(**read_parameters)
+            return _attach_diagrams(
+                result,
+                instance,
+                paper_id=str(kwargs.get("paper_id") or ""),
+                title=str(kwargs.get("title") or ""),
+            )
 
         return read_with_reader
     raise BatchError("src.reader exposes none of read_paper/run_reader/run/process_paper/read")
+
+
+def _paper_metadata(preparation: Mapping[str, Any]) -> dict[str, Any]:
+    """The paper metadata a reading call is given, taken from preprocess.
+
+    Deliberately small: it is part of the prompt, and nearly all of it is
+    visible in the text itself.  What it adds is the source filename and the
+    total page count -- the one thing extracted text cannot show, because a
+    page that failed to render is a page that never appears in it.
+    """
+
+    source = preparation.get("metadata")
+    source = source if isinstance(source, Mapping) else {}
+    metadata: dict[str, Any] = {}
+    for key in ("paper_id", "filename", "total_pages"):
+        value = source.get(key)
+        if value is not None:
+            metadata[key] = value
+    coverage = source.get("input_coverage")
+    if isinstance(coverage, Mapping) and coverage.get("complete") is False:
+        # A paper whose pages did not all render must not be read as complete.
+        metadata["input_coverage_complete"] = False
+    return metadata
+
+
+def _attach_diagrams(result: Any, reader: Any, *, paper_id: str, title: str) -> Any:
+    """Run the separate Mermaid stage and merge it into a reader result.
+
+    The stage is a second, text-only call that reads the grounded report data
+    rather than the PDF, so it cannot move a fact -- only draw one.  A failure
+    here costs the diagrams and nothing else, so it is recorded as an
+    unresolved item instead of being raised: the report itself is already
+    complete, validated and paid for.
+    """
+
+    report = getattr(result, "report", None)
+    generate = getattr(reader, "generate_diagrams", None)
+    if not isinstance(report, dict) or not callable(generate):
+        return result
+    if getattr(getattr(reader, "config", None), "diagrams_enabled", True) is False:
+        return result
+    try:
+        diagrams = generate(paper_id or str(report.get("paper_id", "")), report, title=title)
+    except Exception as exc:  # noqa: BLE001 - a drawing failure is not a reading failure
+        try:
+            from .reader import DIAGRAM_FAILED_PREFIX
+        except ImportError:  # pragma: no cover - reader is part of this project
+            DIAGRAM_FAILED_PREFIX = "方法图生成失败："
+        _merge_unresolved(report, [f"{DIAGRAM_FAILED_PREFIX}{type(exc).__name__}: {exc}"])
+        _resync_unresolved(result, report)
+        return result
+
+    drawn = getattr(diagrams, "diagrams", None)
+    if isinstance(drawn, Sequence) and not isinstance(drawn, (str, bytes)):
+        report["diagrams"] = [dict(item) for item in drawn if isinstance(item, Mapping)]
+    for attribute in ("calls", "raw_responses"):
+        extra = getattr(diagrams, attribute, None)
+        existing = getattr(result, attribute, None)
+        if isinstance(extra, Sequence) and isinstance(existing, list):
+            existing.extend(extra)
+    if hasattr(result, "requests_made"):
+        total = getattr(reader, "requests_made", None)
+        if isinstance(total, int) and not isinstance(total, bool):
+            result.requests_made = total
+    _merge_unresolved(report, getattr(diagrams, "unresolved_items", None))
+    _resync_unresolved(result, report)
+    return result
+
+
+def _resync_unresolved(result: Any, report: Mapping[str, Any]) -> None:
+    """Keep the returned result's review list equal to the report's."""
+
+    items = report.get("unresolved_items")
+    if isinstance(items, list) and hasattr(result, "unresolved_items"):
+        result.unresolved_items = [str(item) for item in items]
 
 
 def _invoke_reader(
@@ -336,6 +469,24 @@ def _invoke_reader(
             image_format="png",
             max_pixels=_deep_get(config, "input", "image_max_pixels", default=None),
         )
+    # The page-marked full text is the input of a text-first reading.  It is
+    # read here rather than inside the reader so that the batch layer owns the
+    # file locations, and so a missing paper.txt is a visible failure instead
+    # of a silently image-only read.
+    text: str | None = None
+    text_value = preparation.get("text_path")
+    if text_value:
+        text_path = Path(str(text_value))
+        if not text_path.is_absolute():
+            text_path = paper_dir / text_path
+        if text_path.exists():
+            text = text_path.read_text(encoding="utf-8")
+        elif _deep_get(config, "input", "mode", default="hybrid_text_visual") == "hybrid_text_visual":
+            raise BatchError(
+                f"input.extract_text=true 但缺少全文文本 {text_path}；"
+                "请重新预处理该 PDF，或关闭 hybrid 模式"
+            )
+
     reader_config = copy.deepcopy(dict(config))
     batch_config = reader_config.setdefault("batch", {})
     if isinstance(batch_config, Mapping):
@@ -360,6 +511,8 @@ def _invoke_reader(
         "prepared": preparation,
         "pages": page_values,
         "paper_pages": page_values,
+        "text": text,
+        "metadata": _paper_metadata(preparation),
         "title": "",
         "renderer": crop_renderer,
         "original_pages": page_values,
@@ -367,6 +520,7 @@ def _invoke_reader(
         "schema_path": Path(__file__).resolve().parents[1] / "schemas" / "report.schema.json",
         "prompt_path": Path(__file__).resolve().parents[1] / "prompts" / "reader.md",
         "refine_prompt_path": Path(__file__).resolve().parents[1] / "prompts" / "refine.md",
+        "diagram_prompt_path": Path(__file__).resolve().parents[1] / "prompts" / "diagram.md",
         "pages_json": preparation.get("pages_path", paper_dir / "pages.json"),
         "config": reader_config,
         "max_requests": max_requests,
@@ -400,8 +554,10 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
         raw_metadata = getattr(value, "metadata", {})
         metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
         calls = getattr(value, "calls", None)
+        requests_made = getattr(value, "requests_made", None)
+        if isinstance(requests_made, int) and not isinstance(requests_made, bool):
+            metadata["requests_made"] = requests_made
         if isinstance(calls, Sequence):
-            metadata["requests_made"] = len(calls)
             metadata["calls"] = [
                 call.as_dict() if hasattr(call, "as_dict") else call
                 for call in calls
@@ -605,11 +761,13 @@ def _retryable(error: BaseException) -> bool:
 def _max_pages(config: Mapping[str, Any]) -> int | None:
     """Page ceiling for a single paper, or ``None`` when the guard is off.
 
-    Every page is uploaded as an image, and images are almost the whole prompt:
-    46 pages measured 109k prompt tokens (~2.4k per page), against 27k-44k for
-    the 11-14 page papers in the same batch.  The ceiling exists so an oversized
-    PDF fails with a reason before its images are rendered and sent, instead of
-    being discovered through an endpoint rejection.
+    In ``full_page_images`` mode every page is uploaded as an image and images
+    are almost the whole prompt: 46 pages measured 109k prompt tokens (~2.4k
+    per page), against 27k-44k for the 11-14 page papers in the same batch.  In
+    ``hybrid_text_visual`` mode the images no longer reach the endpoint, but the
+    ceiling still applies: every page is rendered, indexed and linked, and a
+    thesis-sized PDF should fail with a reason rather than quietly become a
+    very expensive local render.
     """
 
     raw = _deep_get(config, "input", "max_pages", default=DEFAULT_MAX_PAGES)
@@ -617,6 +775,42 @@ def _max_pages(config: Mapping[str, Any]) -> int | None:
         return None
     value = _as_positive_int(raw, "input.max_pages")
     return value
+
+
+def _max_text_chars(config: Mapping[str, Any]) -> int | None:
+    """Character ceiling for the extracted full text, or ``None`` when off."""
+
+    raw = _deep_get(config, "input", "max_text_chars", default=None)
+    if raw is None:
+        return None
+    return _as_positive_int(raw, "input.max_text_chars")
+
+
+def _check_text_limit(preparation: Mapping[str, Any], config: Mapping[str, Any]) -> None:
+    """Stop an over-long full text before it becomes the whole prompt.
+
+    A text-first reading sends the entire extracted text as its prompt, so a
+    book-length PDF would be rejected by the provider as a context-length
+    error.  Failing here names the real reason, with the real size, before any
+    request is paid for.
+    """
+
+    limit = _max_text_chars(config)
+    text_value = preparation.get("text_path")
+    if limit is None or not text_value:
+        return
+    text_path = Path(str(text_value))
+    if not text_path.exists():
+        return
+    try:
+        size = len(text_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BatchError(f"无法读取全文文本 {text_path}：{exc}") from exc
+    if size > limit:
+        raise BatchPermanentError(
+            f"input_over_limit: 全文 {size} 字符，超过 input.max_text_chars={limit}；"
+            "请拆分 PDF 或调高上限后重跑"
+        )
 
 
 def _as_positive_int(value: Any, name: str) -> int:
@@ -672,11 +866,14 @@ def _format_repaired(metadata: Mapping[str, Any]) -> bool:
 def _requests_made(value: Any) -> int:
     """Count the provider requests a reader call actually issued.
 
-    ``ReadResult`` records one entry per logical call, including the visual
-    refinement round, so the per-paper budget is charged for what was really
-    sent rather than for one call per attempt.
+    New reader results and errors expose the exact count, including repairs
+    and failed sends.  The call-list fallback keeps compatibility with older
+    or injected readers that only record successful logical calls.
     """
 
+    direct = getattr(value, "requests_made", None)
+    if isinstance(direct, int) and not isinstance(direct, bool) and direct >= 1:
+        return direct
     calls = getattr(value, "calls", None)
     if isinstance(calls, Sequence) and not isinstance(calls, (str, bytes)):
         return max(1, len(calls))
@@ -795,7 +992,19 @@ def _result_from_job(pdf_path: Path, job_path: Path, job: Mapping[str, Any], *, 
     )
 
 
-def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any], config_fingerprint: str) -> PaperResult:
+def _raise_if_interrupted(stop_event: threading.Event | None) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise BatchInterruptedError("interrupted by user")
+
+
+def process_one(
+    pdf_path: Path,
+    options: BatchOptions,
+    config: Mapping[str, Any],
+    config_fingerprint: str,
+    stop_event: threading.Event | None = None,
+    run_nonce: str | None = None,
+) -> PaperResult:
     paper_id = _paper_id(pdf_path)
     paper_dir = options.workspace_root / paper_id
     paper_dir.mkdir(parents=True, exist_ok=True)
@@ -803,9 +1012,10 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
         pdf_digest = _file_digest(pdf_path)
     except OSError as exc:
         return PaperResult(paper_id, pdf_path, "failed", error=str(exc))
-    run_fingerprint = hashlib.sha256(
-        f"{pdf_digest}:{config_fingerprint}".encode("utf-8")
-    ).hexdigest()[:16]
+    run_identity = f"{pdf_digest}:{config_fingerprint}"
+    if run_nonce is not None:
+        run_identity += f":force:{run_nonce}"
+    run_fingerprint = hashlib.sha256(run_identity.encode("utf-8")).hexdigest()[:16]
     run_dir = paper_dir / "runs" / run_fingerprint
     job_path = run_dir / "job.json"
     report_path = run_dir / "report.json"
@@ -830,6 +1040,8 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
         "status": "running",
         "phase": job.get("phase", "preprocess"),
         "config_fingerprint": config_fingerprint,
+        "forced_reread": run_nonce is not None,
+        "force_nonce": run_nonce,
         "requests": int(job.get("requests", 0) or 0),
         "attempts": int(job.get("attempts", 0) or 0),
         "started_at": job.get("started_at", _now()),
@@ -839,9 +1051,16 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
     }
     run_dir.mkdir(parents=True, exist_ok=True)
     _update_job(job_path, job)
-    _event(run_dir, "job_started", paper_id=paper_id, run_id=run_fingerprint)
+    _event(
+        run_dir,
+        "job_started",
+        paper_id=paper_id,
+        run_id=run_fingerprint,
+        forced_reread=run_nonce is not None,
+    )
 
     try:
+        _raise_if_interrupted(stop_event)
         # Checked before anything is rendered: the endpoint rejects an oversized
         # input anyway, but by then the images have been rendered and the reason
         # arrives as an opaque provider error.
@@ -856,6 +1075,12 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
                 )
         # A report left by an interrupted run is enough to resume from local
         # validation/rendering; no paid reader call is made in that case.
+        # A run that resumes from a report on disk has no in-memory reader
+        # result, so the provenance the earlier run wrote to job.json is the
+        # only thing left to render from.  A fresh read overwrites this below.
+        reader_metadata: Mapping[str, Any] = {
+            "format_repaired": bool(job.get("format_repaired"))
+        }
         preparation: Mapping[str, Any]
         if report_path.exists():
             preparation = {
@@ -869,11 +1094,17 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             _update_job(job_path, job, phase="preprocess")
             preparation = _prepare_pdf(pdf_path, paper_dir, config)
             _event(run_dir, "preprocess_succeeded", pages=len(preparation.get("pages", [])))
+            _raise_if_interrupted(stop_event)
+            # Checked here, not at send time: the text exists only after
+            # preprocessing, and an over-long one must fail before the first
+            # paid request rather than as an opaque provider error.
+            _check_text_limit(preparation, config)
             _update_job(job_path, job, phase="read")
             reader_result: Any = None
             last_error: BaseException | None = None
             total_attempts = options.max_retries + 1
             for attempt in range(1, total_attempts + 1):
+                _raise_if_interrupted(stop_event)
                 if int(job.get("requests", 0)) >= options.max_requests_per_paper:
                     raise BatchPermanentError(
                         "max_requests_per_paper reached before reader call"
@@ -891,12 +1122,25 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
                     )
                     request_count = _requests_made(reader_result)
                     job["requests"] = int(job.get("requests", 0)) + request_count
+                    _update_job(job_path, job)
                     _event(run_dir, "reader_succeeded", attempt=attempt, requests_made=request_count)
+                    _raise_if_interrupted(stop_event)
                     break
+                except BatchInterruptedError:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - persist the exact failure for resume
                     last_error = exc
-                    job["requests"] = int(job.get("requests", 0)) + 1
-                    _event(run_dir, "reader_failed", attempt=attempt, error=str(exc), retryable=_retryable(exc))
+                    request_count = _requests_made(exc)
+                    job["requests"] = int(job.get("requests", 0)) + request_count
+                    _event(
+                        run_dir,
+                        "reader_failed",
+                        attempt=attempt,
+                        error=str(exc),
+                        retryable=_retryable(exc),
+                        requests_made=request_count,
+                    )
+                    _raise_if_interrupted(stop_event)
                     if attempt >= total_attempts or not _retryable(exc):
                         raise
                     _update_job(job_path, job, error=f"attempt {attempt}: {exc}")
@@ -908,9 +1152,43 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             _atomic_json(report_path, report)
             _update_job(job_path, job, phase="validate")
 
+        _raise_if_interrupted(stop_event)
         report = _load_json(report_path)
         if not isinstance(report, Mapping):
             raise BatchError("report.json root must be an object")
+        # Cross-reference cleanup is deterministic rather than a model call.
+        # Apply it again on resume so reports written just before this guard
+        # was introduced can continue at validation without paying to reread
+        # the paper.
+        from .reader import normalize_report_schema_shape, reconcile_cross_references
+
+        report = dict(report)
+        before_reconcile = _stable_json(report)
+        reconcile_cross_references(report)
+        after_reconcile = _stable_json(report)
+        # Mechanical schema coercions (drop forbidden keys, fill empty-string
+        # required fields) run here as well as in the reader so a resumed
+        # report.json from an older run can still reach render without a paid
+        # reread.
+        schema_path = options.config_path.parent / "schemas" / "report.schema.json"
+        shape_fixes: list[str] = []
+        try:
+            shape_schema = _load_json(schema_path) if schema_path.exists() else None
+        except Exception:  # noqa: BLE001 - unusable schema must not block validate
+            shape_schema = None
+        if isinstance(shape_schema, Mapping):
+            shape_fixes = normalize_report_schema_shape(report, shape_schema)
+        if after_reconcile != before_reconcile or shape_fixes:
+            _atomic_json(report_path, report)
+            if after_reconcile != before_reconcile:
+                _event(run_dir, "cross_references_reconciled")
+            if shape_fixes:
+                _event(
+                    run_dir,
+                    "schema_shape_normalized",
+                    fixes=shape_fixes,
+                    source="batch_validate",
+                )
         supplemental = _read_supplemental(run_dir)
         issues, validation_warnings = _validate_report(
             report, options.config_path, paper_dir / "pages.json", supplemental
@@ -920,6 +1198,7 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             _event(run_dir, "validation_failed", errors=issues)
             return PaperResult(paper_id, pdf_path, "failed", title=str(report.get("title", "")), report_path=report_path, job_path=job_path, error="report validation failed")
 
+        _raise_if_interrupted(stop_event)
         pages_path = paper_dir / "pages.json"
         _update_job(job_path, job, phase="render")
         unresolved = (
@@ -978,6 +1257,9 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             output_coverage=metadata["input_coverage"],
             format_repaired=repaired,
             completed_at=_now(),
+            # A near miss (a retried attempt that failed before the one that
+            # worked) stays in the event log; it is not an open error.
+            error=None,
         )
         _event(
             run_dir,
@@ -987,6 +1269,24 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             supplemental_images=len(supplemental),
         )
         return PaperResult(paper_id, pdf_path, status, title, summary, report_path, output_path, job_path, unresolved)
+    except BatchInterruptedError as exc:
+        _update_job(
+            job_path,
+            job,
+            status="interrupted",
+            phase=job.get("phase", "unknown"),
+            error=str(exc),
+            interrupted_at=_now(),
+        )
+        _event(run_dir, "job_interrupted", error=str(exc))
+        return PaperResult(
+            paper_id,
+            pdf_path,
+            "interrupted",
+            report_path=report_path if report_path.exists() else None,
+            job_path=job_path,
+            error=str(exc),
+        )
     except Exception as exc:  # noqa: BLE001 - batch must continue with other papers
         error = f"{type(exc).__name__}: {exc}"
         updates: dict[str, Any] = {
@@ -1007,8 +1307,8 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
 
 def _batch_date(input_path: Path, explicit: str | None = None) -> str:
     if explicit:
-        if not DATE_RE.fullmatch(explicit):
-            raise BatchError("--date must use YYYY-MM-DD")
+        if not DATE_LABEL_RE.fullmatch(explicit):
+            raise BatchError("--date must use YYYY-MM-DD or YYYY-MM-DD-<label>")
         return explicit
     candidates = [input_path.name]
     if input_path.is_file():
@@ -1062,19 +1362,43 @@ def run_batch(input_path: str | os.PathLike[str], options: BatchOptions) -> list
     config_fingerprint = _config_fingerprint(config, options.config_path)
     if options.concurrency < 1:
         raise BatchError("concurrency must be at least 1")
-    worker = lambda pdf: process_one(pdf, options, config, config_fingerprint)
+    stop_event = threading.Event()
+    # One nonce is shared by the whole forced batch.  The PDF digest still
+    # makes each paper's run ID distinct, while a new invocation always gets a
+    # new run directory and therefore cannot see an existing report.json.
+    run_nonce = uuid4().hex if options.force_reread else None
+    worker = lambda pdf: process_one(
+        pdf,
+        options,
+        config,
+        config_fingerprint,
+        stop_event,
+        run_nonce,
+    )
     results: list[PaperResult] = []
-    if options.concurrency == 1 or len(pdfs) <= 1:
-        results = [worker(pdf) for pdf in pdfs]
-    else:
-        with ThreadPoolExecutor(max_workers=options.concurrency, thread_name_prefix="paper") as executor:
+    try:
+        if options.concurrency == 1 or len(pdfs) <= 1:
+            results = [worker(pdf) for pdf in pdfs]
+        else:
+            executor = ThreadPoolExecutor(
+                max_workers=options.concurrency, thread_name_prefix="paper"
+            )
             futures: dict[Future[PaperResult], Path] = {executor.submit(worker, pdf): pdf for pdf in pdfs}
-            for future in as_completed(futures):
-                try:
-                    results.append(future.result())
-                except Exception as exc:  # defensive: process_one normally captures errors
-                    pdf = futures[future]
-                    results.append(PaperResult(_paper_id(pdf), pdf, "failed", error=f"{type(exc).__name__}: {exc}"))
+            try:
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:  # defensive: process_one normally captures errors
+                        pdf = futures[future]
+                        results.append(PaperResult(_paper_id(pdf), pdf, "failed", error=f"{type(exc).__name__}: {exc}"))
+            except KeyboardInterrupt:
+                stop_event.set()
+                raise
+            finally:
+                executor.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
+    except KeyboardInterrupt:
+        stop_event.set()
+        raise
     index_path = options.output_root / options.batch_date / "index.md"
     _write_index(results, index_path)
     return results
@@ -1090,9 +1414,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retries", type=int)
     parser.add_argument("--max-requests-per-paper", type=int)
     parser.add_argument("--backoff", type=float, default=2.0, help="initial retry backoff in seconds")
-    parser.add_argument("--date", help="output batch date (YYYY-MM-DD)")
+    parser.add_argument("--date", help="output batch directory name (YYYY-MM-DD or YYYY-MM-DD-<label>)")
     parser.add_argument("--resume", dest="resume", action="store_true", default=None)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument(
+        "--force",
+        "--force-reread",
+        dest="force_reread",
+        action="store_true",
+        help="create a fresh run and call the model even when report.json already exists",
+    )
     return parser
 
 
@@ -1109,10 +1440,31 @@ def _check_unsupported_config(config: Mapping[str, Any]) -> None:
         raise BatchError(
             f"output.language={language!r} is not implemented; V1 writes zh-CN reports only"
         )
-    if _deep_get(config, "input", "include_all_pdf_pages", default=True) is not True:
+    # The input mode decides whether the reading call uploads every page image
+    # or sends the extracted text, so an unknown value or a contradictory
+    # combination has to stop the run instead of being read as a default: the
+    # difference is the entire cost of the batch.
+    mode = str(_deep_get(config, "input", "mode", default="hybrid_text_visual")).strip()
+    if mode not in INPUT_MODES:
+        raise BatchError(f"input.mode must be one of {', '.join(INPUT_MODES)}; got {mode!r}")
+    include_all = _deep_get(config, "input", "include_all_pdf_pages", default=False)
+    if include_all not in (True, False):
+        raise BatchError(f"input.include_all_pdf_pages must be true or false; got {include_all!r}")
+    if mode == "hybrid_text_visual":
+        if include_all is True:
+            raise BatchError(
+                "input.include_all_pdf_pages=true 与 input.mode=hybrid_text_visual 冲突："
+                "hybrid 模式不下发整页图片；请改为 false，或把 mode 切到 full_page_images 做 A/B"
+            )
+        if _deep_get(config, "input", "extract_text", default=True) is not True:
+            raise BatchError(
+                "input.mode=hybrid_text_visual 需要 input.extract_text=true，"
+                "否则主阅读请求既没有图片也没有全文"
+            )
+    elif include_all is not True:
         raise BatchError(
-            "input.include_all_pdf_pages=false is not implemented; V1 always sends every page "
-            "and fails with a reason instead of dropping pages"
+            "input.mode=full_page_images 需要 input.include_all_pdf_pages=true；"
+            "该模式是整个 A/B 基线，不允许静默地少发页面"
         )
     over_limit = _deep_get(config, "input", "on_input_over_limit", default="fail_with_reason")
     if str(over_limit) != "fail_with_reason":
@@ -1125,9 +1477,10 @@ def _check_unsupported_config(config: Mapping[str, Any]) -> None:
             "verification.automated_verifier=true is not implemented in V1; enable it only after "
             "calibration shows a reproducible net benefit"
         )
-    # Validated here as well as at use: a malformed page ceiling should stop the
-    # run once, not fail every paper in it with the same message.
+    # Validated here as well as at use: a malformed ceiling should stop the run
+    # once, not fail every paper in it with the same message.
     _max_pages(config)
+    _max_text_chars(config)
 
 
 def options_from_args(args: argparse.Namespace) -> BatchOptions:
@@ -1149,6 +1502,7 @@ def options_from_args(args: argparse.Namespace) -> BatchOptions:
         resume=resume,
         retry_backoff_s=max(0.0, float(args.backoff)),
         batch_date=_batch_date(args.input.expanduser().resolve(), args.date),
+        force_reread=bool(args.force_reread),
     )
 
 
@@ -1157,6 +1511,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         options = options_from_args(args)
         results = run_batch(args.input, options)
+    except KeyboardInterrupt:
+        print("interrupted by user", file=sys.stderr)
+        return 130
     except BatchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

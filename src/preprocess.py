@@ -28,6 +28,14 @@ class PreprocessError(RuntimeError):
     """Raised when a PDF cannot be prepared for reading."""
 
 
+# A four-digit publication year, optionally bracketed or with a letter suffix
+# (``2024a``), as reference managers emit it.
+_YEAR_RE = re.compile(r"[\(\[]?(?:19|20)\d{2}[\)\]]?[a-z]?", re.IGNORECASE)
+# Reference managers separate the stem with a spaced hyphen; accept the
+# typographic dashes that arrive from other exporters as well.
+_STEM_SEPARATOR_RE = re.compile(r"\s+[-‐‑‒–—―－]\s+")
+
+
 def _require_fitz() -> Any:
     """Import PyMuPDF only when a PDF operation is actually requested."""
 
@@ -61,19 +69,61 @@ def sha256_file(path: str | os.PathLike[str], *, chunk_size: int = 1024 * 1024) 
     return digest.hexdigest()
 
 
+def _title_first(stem: str) -> str:
+    """Reorder a reference-manager stem into ``Title``, ``Authors``, ``Year``.
+
+    Zotero and friends export ``Authors - Year - Title``; putting the title
+    first leaves a shelf of papers sorted by topic instead of by whoever
+    happens to be the first author.  Anything that is not in that shape — a
+    hand-named file, a stem with no separator, an author list without a year —
+    comes back as the single part it is, unchanged.
+    """
+
+    parts = [part.strip() for part in _STEM_SEPARATOR_RE.split(stem) if part.strip()]
+    if len(parts) < 2:
+        return [stem]
+    year = next((part for part in parts if _YEAR_RE.fullmatch(part)), None)
+    if year is None:
+        authors, title_parts = [parts[0]], parts[1:]
+    else:
+        split = parts.index(year)
+        authors, title_parts = parts[:split], parts[split + 1 :]
+    return [part for part in (" ".join(title_parts), " ".join(authors), year or "") if part]
+
+
+def _normalise_id_part(value: str) -> str:
+    """Reduce one identifier component to filename-safe characters.
+
+    Each component is normalised on its own, so a title or author that ends in
+    a dropped character cannot leave the separators doubled, and runs of
+    dashes collapse into one (``A Title - Song`` is a single separator, not
+    three).
+    """
+
+    replaced = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+    return re.sub(r"-{2,}", "-", replaced).strip(".-_")
+
+
 def make_paper_id(pdf_path: str | os.PathLike[str], paper_id: str | None = None) -> str:
     """Return a filesystem-friendly paper identifier.
 
     An explicit ID is preserved after validation.  For an omitted ID the PDF
-    stem is normalised, which makes the identifier stable across runs while
-    avoiding path separators and control characters.
+    stem is reordered from ``Authors - Year - Title`` into ``Title-Authors-
+    Year``, which makes the identifier stable across runs while avoiding path
+    separators and control characters.
     """
 
-    candidate = paper_id if paper_id is not None else Path(pdf_path).stem
-    candidate = str(candidate).strip()
-    if not candidate:
-        raise PreprocessError("paper_id must not be empty")
-    normalised = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate).strip(".-_")
+    if paper_id is not None:
+        candidate = str(paper_id).strip()
+        if not candidate:
+            raise PreprocessError("paper_id must not be empty")
+        parts = [candidate]
+    else:
+        candidate = Path(pdf_path).stem.strip()
+        parts = _title_first(candidate)
+    normalised = "-".join(
+        part for part in (_normalise_id_part(value) for value in parts) if part
+    )
     if not normalised:
         raise PreprocessError(f"paper_id has no usable filename characters: {candidate!r}")
     return normalised

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -270,6 +271,162 @@ def _walk_evidence_references(value: Any, path: str = "$") -> Iterable[tuple[str
             yield from _walk_evidence_references(child, f"{path}[{index}]")
 
 
+_TEXT_SOURCE_ID = re.compile(r"page-(\d+)-text")
+
+
+def _check_evidence_source(
+    issues: list[ValidationIssue],
+    path: str,
+    item: Mapping[str, Any],
+    *,
+    pdf_page: Any,
+    available_images: set[str] | None,
+    image_to_page: Mapping[str, int],
+) -> None:
+    """Check that an evidence entry cites a source the reader can open.
+
+    A text source has to name the page-marked text of the page it quotes; an
+    image source has to name an image that was really supplied, on the page it
+    claims.  Reports written before evidence had a generic source are still
+    checked through their ``image_id``, so a mixed-version directory does not
+    quietly lose the check.
+    """
+
+    source_type = item.get("source_type")
+    source_id = item.get("source_id")
+    if not isinstance(source_id, str) or not source_id:
+        legacy = item.get("image_id")
+        if not isinstance(legacy, str) or not legacy:
+            return
+        source_type, source_id = "image", legacy
+
+    page_is_int = isinstance(pdf_page, int) and not isinstance(pdf_page, bool)
+    if source_type == "image":
+        if available_images is not None and source_id not in available_images:
+            _issue(
+                issues,
+                f"{path}.source_id",
+                f"image id {source_id!r} is not present in the input page manifest",
+                code="semantic_unknown_image_id",
+            )
+        mapped_page = image_to_page.get(source_id)
+        if mapped_page is not None and page_is_int and mapped_page != pdf_page:
+            _issue(
+                issues,
+                f"{path}.source_id",
+                f"image id {source_id!r} belongs to PDF page {mapped_page}, not {pdf_page}",
+                code="semantic_image_page_mismatch",
+            )
+        return
+    if source_type != "text":
+        # An unknown source type is a schema violation, reported there.
+        return
+    match = _TEXT_SOURCE_ID.fullmatch(source_id)
+    if match is None:
+        _issue(
+            issues,
+            f"{path}.source_id",
+            f"text evidence should cite the page-marked text as page-NNN-text; got {source_id!r}",
+            code="semantic_unexpected_text_source_id",
+            severity="warning",
+        )
+        return
+    cited_page = int(match.group(1))
+    if page_is_int and cited_page != pdf_page:
+        _issue(
+            issues,
+            f"{path}.source_id",
+            f"source id {source_id!r} names PDF page {cited_page}, not {pdf_page}",
+            code="semantic_source_page_mismatch",
+        )
+
+
+def _check_diagrams(
+    report: Mapping[str, Any], issues: list[ValidationIssue]
+) -> None:
+    """Check the diagrams a report carries.
+
+    Every finding here is a warning.  A diagram is a view of the report and
+    not a fact in it, so a diagram that points at the wrong node makes the
+    picture worse -- it does not make the paper's reading undeliverable, and
+    it must never invalidate a report that was already paid for.
+    """
+
+    diagrams = report.get("diagrams")
+    if not isinstance(diagrams, list):
+        return
+    seen_ids: set[str] = set()
+    for index, diagram in enumerate(diagrams):
+        path = f"$.diagrams[{index}]"
+        if not isinstance(diagram, Mapping):
+            continue
+        diagram_id = diagram.get("id")
+        if isinstance(diagram_id, str) and diagram_id.strip():
+            if diagram_id in seen_ids:
+                _issue(
+                    issues,
+                    f"{path}.id",
+                    f"duplicate diagram id {diagram_id!r}",
+                    code="semantic_duplicate_diagram_id",
+                    severity="warning",
+                )
+            seen_ids.add(diagram_id)
+        node_ids: set[str] = set()
+        for node_index, node in enumerate(_mappings(diagram.get("nodes"))):
+            node_id = node.get("id")
+            if not isinstance(node_id, str) or not node_id.strip():
+                continue
+            if node_id in node_ids:
+                _issue(
+                    issues,
+                    f"{path}.nodes[{node_index}].id",
+                    f"duplicate diagram node id {node_id!r}",
+                    code="semantic_duplicate_diagram_node_id",
+                    severity="warning",
+                )
+            node_ids.add(node_id)
+            if not node.get("evidence_ids"):
+                _issue(
+                    issues,
+                    f"{path}.nodes[{node_index}].evidence_ids",
+                    "every diagram node should carry at least one evidence id",
+                    code="semantic_diagram_node_without_evidence",
+                    severity="warning",
+                )
+        for edge_index, edge in enumerate(_mappings(diagram.get("edges"))):
+            for side in ("from", "to"):
+                endpoint = edge.get(side)
+                if isinstance(endpoint, str) and endpoint not in node_ids:
+                    _issue(
+                        issues,
+                        f"{path}.edges[{edge_index}].{side}",
+                        f"unknown diagram node id {endpoint!r}",
+                        code="semantic_unknown_diagram_node_id",
+                        severity="warning",
+                    )
+            relation = edge.get("relation")
+            if not isinstance(relation, str) or not relation.strip():
+                _issue(
+                    issues,
+                    f"{path}.edges[{edge_index}].relation",
+                    "diagram edges must state a relation",
+                    code="semantic_diagram_empty_edge_relation",
+                    severity="warning",
+                )
+            if not edge.get("evidence_ids"):
+                _issue(
+                    issues,
+                    f"{path}.edges[{edge_index}].evidence_ids",
+                    "every diagram edge should carry at least one evidence id",
+                    code="semantic_diagram_edge_without_evidence",
+                    severity="warning",
+                )
+
+
+def _mappings(value: Any) -> list[Mapping[str, Any]]:
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
 def _check_semantics(
     report: Mapping[str, Any],
     issues: list[ValidationIssue],
@@ -310,41 +467,39 @@ def _check_semantics(
                         f"PDF page {pdf_page} is not present in the input page manifest",
                         code="semantic_page_out_of_range",
                     )
-            image_id = item.get("image_id")
-            if isinstance(image_id, str) and image_id:
-                if available_images is not None and image_id not in available_images:
-                    _issue(
-                        issues,
-                        f"{path}.image_id",
-                        f"image id {image_id!r} is not present in the input page manifest",
-                        code="semantic_unknown_image_id",
-                    )
-                mapped_page = image_to_page.get(image_id)
-                if (
-                    mapped_page is not None
-                    and isinstance(pdf_page, int)
-                    and mapped_page != pdf_page
-                ):
-                    _issue(
-                        issues,
-                        f"{path}.image_id",
-                        f"image id {image_id!r} belongs to PDF page {mapped_page}, not {pdf_page}",
-                        code="semantic_image_page_mismatch",
-                    )
+            _check_evidence_source(
+                issues,
+                path,
+                item,
+                pdf_page=pdf_page,
+                available_images=available_images,
+                image_to_page=image_to_page,
+            )
 
-    # Every reference, including those on method nodes and experimental
-    # results, must resolve to an evidence entry from this report.
+    # Every reference, including those on method nodes, experimental results
+    # and the reading guide, must resolve to an evidence entry of this report.
     for path, references in _walk_evidence_references(report):
         if not isinstance(references, list):
             continue  # The schema validator reports the type error.
+        # A diagram is a view of the report rather than a fact in it: an
+        # ungrounded node loses its shape in the picture, it does not make the
+        # reading itself undeliverable.
+        in_diagram = path.startswith("$.diagrams")
         for index, evidence_id in enumerate(references):
             if not isinstance(evidence_id, str) or evidence_id not in evidence_by_id:
                 _issue(
                     issues,
                     f"{path}[{index}]",
                     f"unknown evidence id {evidence_id!r}",
-                    code="semantic_unknown_evidence_id",
+                    code=(
+                        "semantic_unknown_diagram_evidence_id"
+                        if in_diagram
+                        else "semantic_unknown_evidence_id"
+                    ),
+                    severity="warning" if in_diagram else "error",
                 )
+
+    _check_diagrams(report, issues)
 
     claims = report.get("claims")
     claim_ids: set[str] = set()

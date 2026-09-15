@@ -2,8 +2,15 @@ model:
   name: qwen3.8-flash
   base_url_env: DASHSCOPE_BASE_URL
   api_key_env: DASHSCOPE_API_KEY
-  default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  default_base_url: https://llm-mp7jqtxmeetphq4i.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
   thinking: true
+  # Qwen3.8 未指定时会使用很大的动态思考预算。主阅读保留中等预算，补图与结构修复
+  # 使用更小预算，避免一个简单阶段占满 600 秒读取超时。
+  thinking_budget:
+    read: 16384
+    visual_refinement: 8192
+    format_repair: 4096
+    diagram: 4096
   response_mode: json_object
   request_timeout_s: 600
   # 输出上限必须显式设置：端点默认值常常小于一份完整报告，会静默截断 JSON。
@@ -15,23 +22,42 @@ model:
   max_output_tokens: 131072
 
 input:
-  mode: full_page_images
-  include_all_pdf_pages: true
+  # hybrid_text_visual：主阅读请求发送 paper metadata + 带 PDF_PAGE 标记的全文 + schema，
+  # 不再上传全部页面图片；表格/公式/图注等文本无法可靠判断的内容由模型通过
+  # visual_requests 定向补看。full_page_images 保留旧行为，便于 A/B 对比。
+  mode: hybrid_text_visual
+  extract_text: true
+  # 只在 full_page_images 模式下有意义：hybrid 模式本来就整篇不发图，因此必须是 false，
+  # 设成 true 会被 batch 直接拒绝而不是静默忽略。
+  include_all_pdf_pages: false
+  # 页面图片仍然全部渲染：补看要按页渲染 crop，证据索引要能链回原始页面。
+  # 这消耗的是本地 CPU，不是 token。
   render_dpi: 160
   image_format: png
   image_max_pixels: 2621440
-  extract_text: false
   on_input_over_limit: fail_with_reason
-  # 单篇页数上限，超过即 fail_with_reason（不渲染、不发送）。整篇按图片一次性上传，
-  # 图片占 prompt 的绝大部分：实测 46 页 109k prompt tokens，11-14 页 27k-44k。
-  # 设为 null 关闭护栏。
+  # 单篇页数上限，超过即 fail_with_reason（不渲染、不发送）。设为 null 关闭。
   max_pages: 80
+  # 全文长度上限（字符数），保护 hybrid 模式的主请求：超长 PDF 会先在这里停下，
+  # 而不是等到端点以 context length 报错。设为 null 关闭。
+  max_text_chars: 400000
 
 refinement:
   max_visual_rounds: 1
   max_crop_images: 4
   crop_dpi: 300
+  # 每个模型阶段各自最多进行一次纯文本结构修复；主阅读用掉配额后，不会阻止补看或
+  # 方法图修复。所有修复仍计入 batch.max_requests_per_paper。
   max_format_repairs: 1
+
+diagrams:
+  # Mermaid 不再由主阅读调用生成。这一阶段只读已经确认的 grounded report 数据，
+  # 单独发一次请求，产出 1..max_diagrams 张图。
+  enabled: true
+  max_diagrams: 4
+  # 复用主阅读请求的 prompt 前缀（system + 指令 + paper_id/title + 全文 + schema），
+  # 让端点的前缀缓存命中，只按未命中部分付费。关掉则只发送 grounded report 摘要。
+  reuse_reading_prefix: true
 
 batch:
   concurrency: 2

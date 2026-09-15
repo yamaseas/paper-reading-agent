@@ -151,6 +151,100 @@ def render_mermaid(method: Mapping[str, Any]) -> tuple[str, list[str]]:
     return "\n".join(lines), warnings
 
 
+# Node shape per kind.  The shape carries information a rectangle cannot: a
+# decision is a rhombus, an oracle is a hexagon, an artifact is a
+# parallelogram.  Labels are always quoted, and _safe_mermaid_label escapes
+# the quote character, so no model text can change the syntax.
+_DIAGRAM_SHAPES: dict[str, tuple[str, str]] = {
+    "input": ("([\"", "\"])"),
+    "output": ("[[\"", "\"]]"),
+    "component": ("[\"", "\"]"),
+    "artifact": ("[/\"", "\"/]"),
+    "decision": ("{\"", "\"}"),
+    "loop": ("((\"", "\"))"),
+    "oracle": ("{{\"", "\"}}"),
+    "external": ("[\\\"", "\"\\]"),
+    "environment": ("[(\"", "\")]"),
+    "stage": ("(\"", "\")"),
+}
+# A dependency or a feedback loop is drawn dashed: a reader must be able to
+# tell an iteration from a straight-line hand-off at a glance.
+_DASHED_RELATIONS = ("dependency", "feedback")
+
+
+def render_diagram(diagram: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """Render one diagram object as a Mermaid flowchart.
+
+    ``group`` becomes a Mermaid ``subgraph``, so a paper with training,
+    inference and evaluation phases shows them as phases rather than as one
+    flat line.  Only confirmed edges are drawn, exactly as in
+    ``render_mermaid``: an unconfirmed relation is a review hint, and mixing
+    it into the picture would make a guess look like a finding.
+    """
+
+    warnings: list[str] = []
+    nodes = [item for item in _items(diagram.get("nodes")) if isinstance(item, Mapping)]
+    edges = [item for item in _items(diagram.get("edges")) if isinstance(item, Mapping)]
+    ids, node_warnings = _node_ids(nodes)
+    warnings.extend(node_warnings)
+    direction = _text(diagram.get("direction")).strip().upper()
+    lines = [f"flowchart {direction}" if direction in ("LR", "TB") else "flowchart LR"]
+
+    grouped: dict[str, list[str]] = {}
+    ungrouped: list[str] = []
+    for index, node in enumerate(nodes, start=1):
+        original = _text(node.get("id"), f"node_{index}")
+        node_id = ids.get(original)
+        if node_id is None:
+            continue
+        opening, closing = _DIAGRAM_SHAPES.get(
+            _text(node.get("kind")).strip(), _DIAGRAM_SHAPES["component"]
+        )
+        label = _safe_mermaid_label(_text(node.get("label"), original))
+        declaration = f"        {node_id}{opening}{label}{closing}"
+        group = _text(node.get("group")).strip()
+        if group:
+            grouped.setdefault(group, []).append(declaration)
+        else:
+            ungrouped.append(f"    {node_id}{opening}{label}{closing}")
+
+    group_ids: dict[str, str] = {}
+    for position, (group, declarations) in enumerate(grouped.items(), start=1):
+        if group not in group_ids:
+            candidate = re.sub(r"[^A-Za-z0-9_]", "_", group).strip("_")
+            if not candidate or not candidate[0].isalpha():
+                candidate = f"group_{position}"
+            while candidate in group_ids.values():
+                candidate += "_"
+            group_ids[group] = candidate
+        subgraph_id = group_ids[group]
+        lines.append(f'    subgraph {subgraph_id}["{_safe_mermaid_label(group)}"]')
+        lines.extend(declarations)
+        lines.append("    end")
+    lines.extend(ungrouped)
+
+    for edge_index, edge in enumerate(edges, start=1):
+        source = ids.get(_text(edge.get("from")))
+        target = ids.get(_text(edge.get("to")))
+        if not source or not target:
+            warnings.append(f"diagram edge {edge_index} references an unknown node and was omitted")
+            continue
+        if edge.get("confirmed") is not True:
+            warnings.append(
+                f"diagram edge {edge_index} is unconfirmed and was omitted from Mermaid"
+            )
+            continue
+        relation = _text(edge.get("relation")).strip() or "data_flow"
+        label = _text(edge.get("label")).strip()
+        caption = f"{label} · {relation}" if label else relation
+        arrow = "-.->" if relation in _DASHED_RELATIONS else "-->"
+        lines.append(f'    {source} {arrow}|"{_safe_mermaid_label(caption)}"| {target}')
+
+    if len(lines) == 1:
+        lines.append('    empty["本图暂无可用节点"]')
+    return "\n".join(lines), warnings
+
+
 def _read_pages(pages_json: Path | None) -> list[Mapping[str, Any]]:
     if pages_json is None or not pages_json.exists():
         return []
@@ -230,11 +324,19 @@ def _page_image_map(
 def _image_for_evidence(
     evidence: Mapping[str, Any], report_path: Path, image_map: Mapping[str, Path]
 ) -> Path | None:
-    image_id = _text(evidence.get("image_id")).strip()
-    if image_id in image_map:
-        return image_map[image_id]
-    if image_id:
-        candidate = Path(image_id)
+    """Resolve the image a reader should open next to one evidence entry.
+
+    An image source resolves to its own crop or page; a text source has no
+    image of its own, so it links to the page the quote was taken from.  That
+    page is not the evidence -- the quote is -- but it is what a reader wants
+    to open to check the quote, and a broken link would be worse.
+    """
+
+    source_id = _text(evidence.get("source_id")).strip() or _text(evidence.get("image_id")).strip()
+    if source_id in image_map:
+        return image_map[source_id]
+    if source_id:
+        candidate = Path(source_id)
         if not candidate.is_absolute():
             candidate = report_path.parent / candidate
         if candidate.exists():
@@ -263,7 +365,15 @@ def _image_markdown(target: Path, destination: Path, alt: str) -> str:
 
 
 def _render_problem(lines: list[str], problem: Mapping[str, Any]) -> None:
-    lines.extend(["## Q1. 解决什么问题", "", "### 背景", _text(problem.get("background"), "未提供"), ""])
+    lines.extend(
+        [
+            "## Q1: 这篇论文试图解决什么问题？",
+            "",
+            "### 背景",
+            _text(problem.get("background"), "未提供"),
+            "",
+        ]
+    )
     lines.extend(["### 已有不足", _text(problem.get("existing_limitation"), "未提供"), ""])
     lines.extend(["### 研究问题", _text(problem.get("research_question"), "未提供"), ""])
     lines.extend(["### 动机", _text(problem.get("motivation"), "未提供"), ""])
@@ -273,7 +383,7 @@ def _render_problem(lines: list[str], problem: Mapping[str, Any]) -> None:
 
 
 def _render_related_work(lines: list[str], related: Sequence[Any]) -> None:
-    lines.extend(["## Q2. 相关工作", ""])
+    lines.extend(["## Q2: 有哪些相关研究？", ""])
     if not related:
         lines.extend(["材料未提供直接相关工作的结构化信息。", ""])
         return
@@ -294,14 +404,38 @@ def _render_related_work(lines: list[str], related: Sequence[Any]) -> None:
     lines.append("")
 
 
+def _render_artifacts(lines: list[str], values: Any) -> None:
+    """Render the named intermediate products a method passes between steps."""
+
+    entries = [item for item in _items(values) if isinstance(item, Mapping)]
+    if not entries:
+        lines.extend(["未提供。", ""])
+        return
+    lines.extend(["| 中间产物 | 说明 | 证据 |", "| --- | --- | --- |"])
+    for entry in entries:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _md_cell(entry.get("name")),
+                    _md_cell(entry.get("description")),
+                    _md_cell(_evidence_refs(entry.get("evidence_ids"))),
+                ]
+            )
+            + " |"
+        )
+    lines.append("")
+
+
 def _render_method(
     lines: list[str],
     method: Mapping[str, Any],
     include_mermaid: bool,
     include_method_steps: bool = True,
+    diagrams: Sequence[Any] = (),
 ) -> list[str]:
     warnings: list[str] = []
-    lines.extend(["## Q3. 方法", ""])
+    lines.extend(["## Q3: 论文如何解决这个问题？", ""])
     if method.get("applicable") is False:
         lines.extend(["本文不适用流程型方法图。", ""])
     lines.extend(["### 方法概述", _text(method.get("overview"), "未提供"), ""])
@@ -309,9 +443,19 @@ def _render_method(
     lines.extend(["### 输出", *_bullets(method.get("outputs")), ""])
 
     if include_mermaid:
-        graph, graph_warnings = render_mermaid(method)
-        warnings.extend(graph_warnings)
-        lines.extend(["### 方法图", "", "```mermaid", graph, "```", ""])
+        rendered = [item for item in _items(diagrams) if isinstance(item, Mapping)]
+        lines.extend(["### 方法图", ""])
+        if rendered:
+            for index, diagram in enumerate(rendered, start=1):
+                graph, graph_warnings = render_diagram(diagram)
+                warnings.extend(graph_warnings)
+                caption = _text(diagram.get("title"), f"图 {index}")
+                lines.extend([f"#### 图 {index}：{caption}", "", "```mermaid", graph, "```", ""])
+        else:
+            # A report from before the diagram stage existed still gets one.
+            graph, graph_warnings = render_mermaid(method)
+            warnings.extend(graph_warnings)
+            lines.extend(["```mermaid", graph, "```", ""])
 
     nodes = [item for item in _items(method.get("nodes")) if isinstance(item, Mapping)]
     if nodes:
@@ -346,6 +490,49 @@ def _render_method(
             lines.append("未提供。")
         lines.append("")
 
+    lines.extend(["### 中间产物", ""])
+    _render_artifacts(lines, method.get("intermediate_artifacts"))
+
+    tools = [item for item in _items(method.get("tools_and_models")) if isinstance(item, Mapping)]
+    lines.extend(["### 工具与模型", ""])
+    if tools:
+        lines.extend(["| 工具 / 模型 | 在流程中的角色 | 证据 |", "| --- | --- | --- |"])
+        for tool in tools:
+            lines.append("| " + " | ".join([
+                _md_cell(tool.get("name")),
+                _md_cell(tool.get("role")),
+                _md_cell(_evidence_refs(tool.get("evidence_ids"))),
+            ]) + " |")
+    else:
+        lines.append("未提供。")
+    lines.append("")
+
+    lines.extend(["### 反馈环与判断点", ""])
+    loops = [item for item in _items(method.get("feedback_loops")) if isinstance(item, Mapping)]
+    decisions = [item for item in _items(method.get("decisions")) if isinstance(item, Mapping)]
+    if loops:
+        lines.append("**反馈环 / 迭代：**")
+        for loop in loops:
+            node_ids = ", ".join(f"`{_text(item)}`" for item in _items(loop.get("node_ids")))
+            suffix = f"（涉及节点：{node_ids}）" if node_ids else ""
+            lines.append(
+                f"- {_text(loop.get('description'), '未提供')}{suffix}"
+                f"（证据：{_evidence_refs(loop.get('evidence_ids'))}）"
+            )
+        lines.append("")
+    if decisions:
+        lines.append("**判断点与分支：**")
+        for decision in decisions:
+            branches = "；".join(_text(item) for item in _items(decision.get("branches")))
+            suffix = f"，分支：{branches}" if branches else ""
+            lines.append(
+                f"- 条件：{_text(decision.get('condition'), '未提供')}{suffix}"
+                f"（证据：{_evidence_refs(decision.get('evidence_ids'))}）"
+            )
+        lines.append("")
+    if not loops and not decisions:
+        lines.extend(["未提供。", ""])
+
     details = [item for item in _items(method.get("implementation_details")) if isinstance(item, Mapping)]
     lines.extend(["### 关键实现细节", ""])
     if details:
@@ -363,7 +550,7 @@ def _render_method(
 
 
 def _render_experiments(lines: list[str], experiments: Sequence[Any]) -> None:
-    lines.extend(["## Q4. 实验", ""])
+    lines.extend(["## Q4: 论文做了哪些实验？", ""])
     if not experiments:
         lines.extend(["未提供结构化实验信息。", ""])
         return
@@ -372,7 +559,8 @@ def _render_experiments(lines: list[str], experiments: Sequence[Any]) -> None:
             continue
         lines.extend([f"### 实验 {index}", ""])
         fields = [
-            ("研究问题 / 实验目的", "research_question"),
+            ("实验目的", "purpose"),
+            ("研究问题", "research_question"),
             ("数据集", "dataset"),
             ("样本规模", "sample_size"),
             ("Baseline", "baselines"),
@@ -389,12 +577,85 @@ def _render_experiments(lines: list[str], experiments: Sequence[Any]) -> None:
         lines.append("")
         lines.append("**主要结果：**")
         lines.extend(_bullets(experiment.get("main_results")))
+        lines.extend(["", f"**结论：** {_text(experiment.get('conclusion'), '未提供')}"])
         lines.append(f"证据：{_evidence_refs(experiment.get('evidence_ids'))}")
         lines.append("")
 
 
+def _render_text_items(lines: list[str], values: Any, prefix: str = "") -> None:
+    """Render a list of evidence-bearing sentences, or say there is none."""
+
+    entries = [item for item in _items(values) if isinstance(item, Mapping)]
+    if not entries:
+        lines.extend(["未提供。", ""])
+        return
+    for entry in entries:
+        lines.append(
+            f"- {prefix}{_text(entry.get('text'), '未提供')}"
+            f"（证据：{_evidence_refs(entry.get('evidence_ids'))}）"
+        )
+    lines.append("")
+
+
+def _render_future_work(lines: list[str], report: Mapping[str, Any]) -> None:
+    """Q5, with the author's own words kept apart from the reader's analysis."""
+
+    future = report.get("future_work")
+    future = future if isinstance(future, Mapping) else {}
+    lines.extend(["## Q5: 有什么可以进一步探索的点？", ""])
+
+    lines.extend(["### 作者明确提出的 Future Work", ""])
+    lines.extend(["**作者承认的局限：**"])
+    limitations = future.get("authors_limitations")
+    if limitations is None:
+        # A report written before future_work was nested still has these.
+        limitations = report.get("authors_limitations")
+    _render_text_items(lines, limitations)
+    lines.append("**作者提出的后续工作：**")
+    _render_text_items(lines, future.get("authors_future_work"))
+
+    lines.extend(["### 基于本文结果可以继续探索的问题（Reader / LLM 分析）", ""])
+    _render_text_items(lines, future.get("open_questions"), prefix="**[LLM Analysis]** ")
+    lines.extend(["### 值得进一步研究的具体方向（Reader / LLM 分析）", ""])
+    _render_text_items(lines, future.get("research_directions"), prefix="**[LLM Analysis]** ")
+
+    analysis = [item for item in _items(report.get("reader_analysis")) if isinstance(item, Mapping)]
+    if analysis:
+        lines.extend(["### Reader 补充分析", ""])
+        _render_text_items(lines, analysis, prefix="**[LLM Analysis]** ")
+
+
+def _render_reading_guide(lines: list[str], report: Mapping[str, Any]) -> None:
+    """Q7: what to do next, deliberately not a second summary."""
+
+    guide = report.get("reading_guide")
+    guide = guide if isinstance(guide, Mapping) else {}
+    lines.extend(["## Q7: 想要进一步了解论文", ""])
+    sections = [
+        ("最值得精读的章节 / Figure / Table", "key_sections"),
+        ("需要补充理解的关键概念", "key_concepts"),
+        ("最值得继续追问的问题", "open_questions"),
+        ("复现论文需要关注什么", "reproduction_notes"),
+        ("值得继续阅读的相关方向", "related_directions"),
+    ]
+    for title, key in sections:
+        lines.extend([f"### {title}", ""])
+        entries = [item for item in _items(guide.get(key)) if isinstance(item, Mapping)]
+        if not entries:
+            lines.extend(["未提供。", ""])
+            continue
+        for entry in entries:
+            target = _text(entry.get("target")).strip()
+            prefix = f"**{target}**：" if target else ""
+            lines.append(
+                f"- {prefix}{_text(entry.get('text'), '未提供')}"
+                f"（证据：{_evidence_refs(entry.get('evidence_ids'))}）"
+            )
+        lines.append("")
+
+
 def _render_claims(lines: list[str], claims: Sequence[Any]) -> None:
-    lines.extend(["## Claims", ""])
+    lines.extend(["### 关键论断（claims）", ""])
     if not claims:
         lines.extend(["未提供。", ""])
         return
@@ -421,7 +682,7 @@ def _render_evidence(
     if not evidence:
         lines.extend(["未提供。", ""])
         return 0
-    lines.extend(["| ID | PDF 页 | Section | Figure / Table | Locator | Quote | Image |", "| --- | ---: | --- | --- | --- | --- | --- |"])
+    lines.extend(["| ID | 来源 | PDF 页 | Section | Figure / Table | Locator | Quote | Image |", "| --- | --- | ---: | --- | --- | --- | --- | --- |"])
     linked = 0
     for item in evidence:
         if not isinstance(item, Mapping):
@@ -429,10 +690,13 @@ def _render_evidence(
         image_path = _image_for_evidence(item, report_path, image_map)
         image = "—"
         if image_path is not None:
-            image = f"[page image]({_relative_link(image_path, report_path)})"
+            kind = _text(item.get("source_type")).strip()
+            label = "补看图" if kind == "image" else "原文页"
+            image = f"[{label}]({_relative_link(image_path, report_path)})"
             linked += 1
         lines.append("| " + " | ".join([
             _md_cell(item.get("id")),
+            _md_cell(_source_label(item)),
             _md_cell(item.get("pdf_page")),
             _md_cell(item.get("section")),
             _md_cell(item.get("figure_or_table")),
@@ -442,6 +706,18 @@ def _render_evidence(
         ]) + " |")
     lines.append("")
     return linked
+
+
+def _source_label(evidence: Mapping[str, Any]) -> str:
+    """One cell naming where a fact was read from."""
+
+    source_type = _text(evidence.get("source_type")).strip()
+    source_id = _text(evidence.get("source_id")).strip() or _text(evidence.get("image_id")).strip()
+    if source_type == "image":
+        return f"补看图 `{source_id}`" if source_id else "补看图"
+    if source_type == "text":
+        return f"全文 `{source_id}`" if source_id else "全文"
+    return f"`{source_id}`" if source_id else "—"
 
 
 def _render_unresolved(lines: list[str], report: Mapping[str, Any]) -> None:
@@ -518,33 +794,14 @@ def render_report(
         method if isinstance(method, Mapping) else {},
         include_mermaid,
         include_method_steps,
+        _items(report.get("diagrams")),
     )
     _render_experiments(lines, _items(report.get("experiments")))
+    _render_future_work(lines, report)
 
-    lines.extend(["## Q5. 局限与展望", "", "### 作者明确报告的局限 / 未来工作", ""])
-    limitations = _items(report.get("authors_limitations"))
-    if limitations:
-        for item in limitations:
-            if isinstance(item, Mapping):
-                lines.append(f"- {_text(item.get('text'), '未提供')}（证据：{_evidence_refs(item.get('evidence_ids'))}）")
-            else:
-                lines.append(f"- {_text(item)}")
-    else:
-        lines.append("未提供。")
-    lines.extend(["", "### Reader 分析", ""])
-    analysis = _items(report.get("reader_analysis"))
-    if analysis:
-        for item in analysis:
-            if isinstance(item, Mapping):
-                lines.append(f"- **[LLM Analysis]** {_text(item.get('text'), '未提供')}（证据：{_evidence_refs(item.get('evidence_ids'))}）")
-            else:
-                lines.append(f"- **[LLM Analysis]** {_text(item)}")
-    else:
-        lines.append("未提供。")
-    lines.append("")
-
-    lines.extend(["## Q6. 完整总结", "", _text(report.get("full_summary"), "未提供"), ""])
+    lines.extend(["## Q6: 总结一下论文的主要内容", "", _text(report.get("full_summary"), "未提供"), ""])
     _render_claims(lines, _items(report.get("claims")))
+    _render_reading_guide(lines, report)
 
     visual_requests = [item for item in _items(report.get("visual_requests")) if isinstance(item, Mapping)]
     lines.extend(["## 待补看请求", ""])
