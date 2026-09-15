@@ -158,7 +158,7 @@ def _issue(
 def _normalise_page_manifest(
     pages: Any,
     page_count: int | None = None,
-    extra_image_ids: Iterable[str] | None = None,
+    extra_image_ids: Iterable[str] | Mapping[str, Any] | None = None,
 ) -> tuple[set[int] | None, set[str] | None, dict[str, int]]:
     """Extract page and image identities from a pages manifest or list."""
 
@@ -222,9 +222,23 @@ def _normalise_page_manifest(
                             image_ids.add(item)
                             image_ids.add(Path(item).name)
     if extra_image_ids is not None:
-        for value in extra_image_ids:
-            if isinstance(value, str) and value:
-                image_ids.add(value)
+        # A mapping is ``image_id -> pdf_page``: crops and re-rendered pages
+        # that were supplied during visual refinement belong to a real page but
+        # never appear in the stable page manifest.  Accepting a plain iterable
+        # keeps the older call style working.
+        items = (
+            extra_image_ids.items()
+            if isinstance(extra_image_ids, Mapping)
+            else ((value, None) for value in extra_image_ids)
+        )
+        for value, page in items:
+            if not isinstance(value, str) or not value:
+                continue
+            image_ids.add(value)
+            image_ids.add(Path(value).name)
+            if isinstance(page, int) and not isinstance(page, bool):
+                image_to_page.setdefault(value, page)
+                image_to_page.setdefault(Path(value).name, page)
 
     if not page_numbers:
         total = page_count if page_count is not None else manifest_total
@@ -262,7 +276,7 @@ def _check_semantics(
     *,
     pages: Any = None,
     page_count: int | None = None,
-    image_ids: Iterable[str] | None = None,
+    image_ids: Iterable[str] | Mapping[str, Any] | None = None,
 ) -> None:
     available_pages, available_images, image_to_page = _normalise_page_manifest(
         pages, page_count, image_ids
@@ -433,11 +447,15 @@ def _check_semantics(
             page = request.get("pdf_page")
             if isinstance(page, int) and not isinstance(page, bool) and available_pages is not None:
                 if page not in available_pages:
+                    # A page that is not in the input is not executed: the
+                    # request is recorded and the paper still delivers the
+                    # report it did manage to produce.
                     _issue(
                         issues,
                         f"$.visual_requests[{index}].pdf_page",
                         f"PDF page {page} is not present in the input page manifest",
                         code="semantic_visual_page_out_of_range",
+                        severity="warning",
                     )
             crop = request.get("crop")
             if crop is None:
@@ -454,6 +472,7 @@ def _check_semantics(
                     f"$.visual_requests[{index}].crop",
                     "crop coordinates must be finite",
                     code="semantic_invalid_crop",
+                    severity="warning",
                 )
             elif not (0 <= values[0] < values[2] <= 1 and 0 <= values[1] < values[3] <= 1):
                 _issue(
@@ -461,6 +480,7 @@ def _check_semantics(
                     f"$.visual_requests[{index}].crop",
                     "crop must satisfy 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1",
                     code="semantic_invalid_crop",
+                    severity="warning",
                 )
 
 
@@ -470,7 +490,7 @@ def validate_report(
     schema_path: str | Path | None = None,
     pages: Any = None,
     page_count: int | None = None,
-    image_ids: Iterable[str] | None = None,
+    image_ids: Iterable[str] | Mapping[str, Any] | None = None,
     check_schema: bool = True,
     check_semantics: bool = True,
 ) -> ValidationResult:
@@ -480,6 +500,11 @@ def validate_report(
     list of page entries.  Pass it whenever page/image references need to be
     checked; without it, report-local evidence and graph invariants are still
     checked.
+
+    ``image_ids`` lists images supplied outside the stable manifest, such as
+    the crops and re-rendered pages from one visual-refinement round.  Pass a
+    mapping of ``image_id -> pdf_page`` so their evidence entries are checked
+    against the right page instead of being rejected as unknown.
     """
 
     issues: list[ValidationIssue] = []
@@ -540,7 +565,7 @@ def validate_report_file(
     schema_path: str | Path | None = None,
     pages: Any = None,
     page_count: int | None = None,
-    image_ids: Iterable[str] | None = None,
+    image_ids: Iterable[str] | Mapping[str, Any] | None = None,
     check_schema: bool = True,
     check_semantics: bool = True,
 ) -> ValidationResult:

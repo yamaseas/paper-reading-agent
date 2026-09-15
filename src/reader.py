@@ -22,13 +22,37 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, MutableMapping, Protocol, Sequence
+from typing import (
+    Any,
+    Callable,
+    Container,
+    Iterable,
+    Mapping,
+    MutableMapping,
+    Protocol,
+    Sequence,
+)
 from uuid import uuid4
 
 
 DEFAULT_MODEL = "qwen3.8-flash"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "report.schema.json"
+# Marks the unresolved items this module derives itself, so they can be
+# recomputed from the report instead of accumulating across rounds.
+UNCONFIRMED_EDGE_PREFIX = "未确认的方法关系："
+PENDING_REQUEST_PREFIX = "补看请求未能执行："
+# A request the refinement round did execute but that came back in the revised
+# report anyway: the crop was looked at and the question is still open, so
+# "pending" would misdescribe it.
+REFINED_UNRESOLVED_PREFIX = "补看后仍未解决："
+# Items under these prefixes are derived by this module and are recomputed
+# from the report at hand, so they must never be carried across rounds.
+DERIVED_PREFIXES = (
+    UNCONFIRMED_EDGE_PREFIX,
+    PENDING_REQUEST_PREFIX,
+    REFINED_UNRESOLVED_PREFIX,
+)
 
 
 def load_env_file(path: str | os.PathLike[str] | None = None) -> Path | None:
@@ -87,7 +111,22 @@ class ReaderAPIError(ReaderError):
 
 
 class ReaderResponseError(ReaderError):
-    """The endpoint returned an unusable or truncated response."""
+    """The endpoint returned an unusable or truncated response.
+
+    Two flags decide what to do next, and they are mutually exclusive:
+
+    ``repairable``
+        The raw text is real content that one text-only repair round may be
+        able to re-emit as valid JSON (``raw_content`` carries it).
+    ``retryable_with_images``
+        The visible output held no report content at all — an empty message,
+        ``[]``, ``{}``.  There is nothing to reformat, so the repair round is
+        skipped and only a fresh attempt with the page images can help.
+    """
+
+    repairable: bool = False
+    retryable_with_images: bool = False
+    raw_content: str | None = None
 
 
 class EventRecorder(Protocol):
@@ -127,10 +166,12 @@ class ReaderConfig:
     thinking: bool | None = True
     response_mode: str = "json_object"
     request_timeout_s: float = 600.0
+    max_output_tokens: int | None = None
     render_dpi: int = 160
     crop_dpi: int = 300
     max_visual_rounds: int = 1
     max_crop_images: int = 4
+    max_format_repairs: int = 1
     max_retries_per_call: int = 2
     max_requests_per_paper: int = 6
 
@@ -166,6 +207,15 @@ class ReaderConfig:
         if thinking is not None and not isinstance(thinking, bool):
             raise ReaderConfigError("model.thinking must be true, false, or null")
 
+        # An unset output limit leaves the endpoint default in place, which is
+        # usually too small for a full report and silently truncates the JSON.
+        raw_output_tokens = model_cfg.get("max_output_tokens", model_cfg.get("max_tokens"))
+        max_output_tokens = (
+            None
+            if raw_output_tokens is None
+            else _positive_int(raw_output_tokens, "model.max_output_tokens")
+        )
+
         return cls(
             model=model,
             base_url=base_url,
@@ -175,6 +225,7 @@ class ReaderConfig:
             request_timeout_s=_positive_float(
                 model_cfg.get("request_timeout_s", 600), "model.request_timeout_s"
             ),
+            max_output_tokens=max_output_tokens,
             render_dpi=_positive_int(input_cfg.get("render_dpi", 160), "input.render_dpi"),
             crop_dpi=_positive_int(refinement_cfg.get("crop_dpi", 300), "refinement.crop_dpi"),
             max_visual_rounds=_nonnegative_int(
@@ -182,6 +233,9 @@ class ReaderConfig:
             ),
             max_crop_images=_nonnegative_int(
                 refinement_cfg.get("max_crop_images", 4), "refinement.max_crop_images"
+            ),
+            max_format_repairs=_nonnegative_int(
+                refinement_cfg.get("max_format_repairs", 1), "refinement.max_format_repairs"
             ),
             max_retries_per_call=_nonnegative_int(
                 batch_cfg.get("max_retries_per_call", 2), "batch.max_retries_per_call"
@@ -248,12 +302,18 @@ class CallRecord:
     error: str | None = None
     provided_pages: list[int] = field(default_factory=list)
     provided_images: list[str] = field(default_factory=list)
+    # Set when the delivered report came out of a text-only repair round: the
+    # content was restructured (or, if the repair payload carried no substance,
+    # generated) without any page image, which a reader of the report cannot
+    # tell from the report itself.
+    format_repaired: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "call_type": self.call_type,
             "request_id": self.request_id,
             "attempts": self.attempts,
+            "format_repaired": self.format_repaired,
             "usage": self.usage,
             "response_id": self.response_id,
             "finish_reason": self.finish_reason,
@@ -275,6 +335,10 @@ class ReadResult:
     calls: list[CallRecord] = field(default_factory=list)
     raw_responses: list[Any] = field(default_factory=list)
     unresolved_items: list[str] = field(default_factory=list)
+    # Crops and re-rendered pages sent during the refinement round.  They are
+    # not part of the stable page manifest, so downstream validation and
+    # rendering must be told about them explicitly.
+    supplemental_images: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def visual_requests(self) -> list[dict[str, Any]]:
@@ -286,6 +350,7 @@ class ReadResult:
             "report": self.report,
             "calls": [call.as_dict() for call in self.calls],
             "unresolved_items": list(self.unresolved_items),
+            "supplemental_images": [dict(item) for item in self.supplemental_images],
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -300,6 +365,13 @@ class _ResponseResult:
 
 
 Renderer = Callable[..., Any]
+
+
+DEFAULT_REFINE_INSTRUCTIONS = """You are revising one candidate paper-reading report. You receive the candidate report JSON, the original pages that were unclear, and sharper crops of the areas in question.
+
+Revise only the content that the newly supplied images actually change: numbers, table or figure readings, method relations, and the evidence entries behind them. Keep every other part of the candidate report unchanged, including wording, ordering, and evidence IDs that the new images do not touch. Do not re-read the whole paper from these few pages and do not treat pages that were not re-sent as missing material.
+
+Add new evidence entries with new IDs whose image_id is one of the images supplied in this call. If the new images still do not settle a question, keep the previous wording, set the value aside, and list the item in unresolved_items. Return one JSON object matching the supplied report schema and nothing else."""
 
 
 DEFAULT_READER_INSTRUCTIONS = """You are a careful scientific paper reader. Read every supplied PDF page in order and return exactly one JSON object matching the supplied report schema.
@@ -320,13 +392,16 @@ class Reader:
         event_recorder: EventRecorder | Callable[[Mapping[str, Any]], None] | None = None,
         schema_path: str | os.PathLike[str] | None = None,
         prompt_path: str | os.PathLike[str] | None = None,
+        refine_prompt_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.config = _coerce_config(config)
         self._client = client
         self.event_recorder = event_recorder
         self.schema_path = Path(schema_path) if schema_path else DEFAULT_SCHEMA_PATH
         self.prompt_path = Path(prompt_path) if prompt_path else None
+        self.refine_prompt_path = Path(refine_prompt_path) if refine_prompt_path else None
         self._request_count = 0
+        self._format_repairs_used = 0
 
     @property
     def client(self) -> Any:
@@ -381,6 +456,7 @@ class Reader:
         if not normalized_pages:
             raise ReaderInputError("At least one rendered PDF page is required")
         self._request_count = 0
+        self._format_repairs_used = 0
         first = self._call_report(
             call_type="read",
             paper_id=paper_id,
@@ -397,35 +473,52 @@ class Reader:
 
         requests = _visual_requests(first.report)
         if not requests or self.config.max_visual_rounds < 1:
-            return result
+            return _finalize(result)
 
         available = normalize_pages(original_pages or normalized_pages)
-        refined, unresolved = self._refine_once(
-            paper_id=paper_id,
-            candidate=first.report,
-            requests=requests,
-            available_pages=available,
-            renderer=renderer,
-            title=title,
-            prompt=prompt,
-            schema=schema,
-        )
-        result.unresolved_items.extend(unresolved)
+        # A refinement round returns a whole report, so anything the first
+        # round set aside has to be carried across that replacement: an
+        # uncertainty that vanishes from the file is an uncertainty the reader
+        # of the report can no longer see.
+        carried = _carryable_unresolved(first.report)
+        # The refinement round has its own instructions: it revisits a few
+        # pages of an already written report instead of reading a whole paper.
+        refine_prompt = prompt if prompt is not None else self._load_refine_prompt()
+        try:
+            refined, unresolved, supplemental = self._refine_once(
+                paper_id=paper_id,
+                candidate=first.report,
+                requests=requests,
+                available_pages=available,
+                renderer=renderer,
+                title=title,
+                prompt=refine_prompt,
+                schema=schema,
+            )
+        except ReaderError as exc:
+            # The first round already produced a complete, schema-valid report.
+            # A follow-up that fails is a missing improvement, not a missing
+            # paper, so the candidate is delivered with the failure recorded
+            # instead of being thrown away and paid for twice on a retry.
+            _append_unresolved_to_report(result.report, [f"补看轮次失败：{exc}"])
+            _normalize_report(result.report)
+            return _finalize(result)
+        executed = _executed_request_keys(supplemental)
         if refined is None:
             _append_unresolved_to_report(result.report, unresolved)
-            return result
+            _normalize_report(result.report, executed)
+            return _finalize(result)
+        result.unresolved_items.extend(unresolved)
         result.report = refined.report
         result.calls.append(refined.record)
         result.raw_responses.append(refined.response)
-        remaining = _visual_requests(result.report)
-        if remaining:
-            unresolved_remaining = [
-                f"补看后模型仍请求 PDF 第 {item.get('pdf_page', '?')} 页：{item.get('reason', '')}".strip()
-                for item in remaining
-            ]
-            result.unresolved_items.extend(unresolved_remaining)
-            _append_unresolved_to_report(result.report, unresolved_remaining)
-        return result
+        result.supplemental_images = supplemental
+        _merge_carried(result, carried)
+        # Keep the revised report self-describing: a reader of report.json
+        # alone must be able to see why something was left unverified.
+        _append_unresolved_to_report(result.report, unresolved)
+        _normalize_report(result.report, executed)
+        return _finalize(result)
 
     # Explicit aliases make the small interface convenient for batch.py and
     # for scripts written before the ReadResult wrapper was introduced.
@@ -456,38 +549,39 @@ class Reader:
         """
 
         if self.config.max_visual_rounds < 1:
-            return ReadResult(report=dict(candidate))
+            return _finalize(ReadResult(report=dict(candidate)))
         available = normalize_pages(pages)
         selected = list(requests) if requests is not None else _visual_requests(candidate)
-        refined, unresolved = self._refine_once(
+        carried = _carryable_unresolved(candidate)
+        refine_prompt = prompt if prompt is not None else self._load_refine_prompt()
+        refined, unresolved, supplemental = self._refine_once(
             paper_id=paper_id,
             candidate=dict(candidate),
             requests=selected,
             available_pages=available,
             renderer=renderer,
             title=title,
-            prompt=prompt,
+            prompt=refine_prompt,
             schema=schema,
         )
+        # `_refine_once` only returns no report when no crop could be rendered,
+        # so the executed set is empty on that path.
+        executed = _executed_request_keys(supplemental)
         if refined is None:
             report = dict(candidate)
             _append_unresolved_to_report(report, unresolved)
-            return ReadResult(report=report, unresolved_items=unresolved)
+            _normalize_report(report, executed)
+            return _finalize(ReadResult(report=report))
         result = ReadResult(
             report=refined.report,
             calls=[refined.record],
             raw_responses=[refined.response],
-            unresolved_items=unresolved,
+            supplemental_images=supplemental,
         )
-        remaining = _visual_requests(result.report)
-        if remaining:
-            more = [
-                f"补看后模型仍请求 PDF 第 {item.get('pdf_page', '?')} 页：{item.get('reason', '')}".strip()
-                for item in remaining
-            ]
-            result.unresolved_items.extend(more)
-            _append_unresolved_to_report(result.report, more)
-        return result
+        _merge_carried(result, carried)
+        _append_unresolved_to_report(result.report, unresolved)
+        _normalize_report(result.report, executed)
+        return _finalize(result)
 
     def _refine_once(
         self,
@@ -500,9 +594,15 @@ class Reader:
         title: str,
         prompt: str | None,
         schema: Mapping[str, Any] | None,
-    ) -> tuple[_ResponseResult | None, list[str]]:
+    ) -> tuple[_ResponseResult | None, list[str], list[dict[str, Any]]]:
         by_page = {page.pdf_page: page for page in available_pages}
         supplemental: list[PageImage] = []
+        supplemental_records: list[dict[str, Any]] = []
+        # Only the requests that survived validation are allowed into the
+        # follow-up call.  Re-deriving pages from the raw model requests here
+        # would let a malformed entry (a null page, a string page) raise
+        # instead of being recorded as unresolved.
+        accepted: list[tuple[int, dict[str, Any]]] = []
         unresolved: list[str] = []
         for request in requests:
             if len(supplemental) >= self.config.max_crop_images:
@@ -538,28 +638,36 @@ class Reader:
                         f"renderer returned page {image.pdf_page}, expected page {page_number}"
                     )
                 supplemental.append(image)
+                supplemental_records.append(
+                    {
+                        "image_id": image.stable_id(),
+                        "pdf_page": page_number,
+                        "path": str(image.path),
+                        "crop": dict(crop) if isinstance(crop, Mapping) else None,
+                        "dpi": float(self.config.crop_dpi),
+                        "reason": str(request.get("reason", "")),
+                    }
+                )
+                accepted.append((page_number, dict(request)))
             except ReaderError as exc:
                 unresolved.append(f"PDF 第 {page_number} 页补图失败：{exc}")
             except Exception as exc:
                 unresolved.append(f"PDF 第 {page_number} 页补图失败：{type(exc).__name__}: {exc}")
 
         if not supplemental:
-            return None, unresolved
-        try:
-            refined = self._call_report(
-                call_type="visual_refinement",
-                paper_id=paper_id,
-                pages=supplemental,
-                title=title,
-                prompt=prompt,
-                schema=schema,
-                candidate=candidate,
-                visual_reasons=[str(item.get("reason", "")) for item in requests],
-                original_pages=[by_page[int(item["pdf_page"])] for item in requests if int(item.get("pdf_page", 0)) in by_page],
-            )
-            return refined, unresolved
-        except ReaderError:
-            raise
+            return None, unresolved, supplemental_records
+        refined = self._call_report(
+            call_type="visual_refinement",
+            paper_id=paper_id,
+            pages=supplemental,
+            title=title,
+            prompt=prompt,
+            schema=schema,
+            candidate=candidate,
+            visual_reasons=[str(request.get("reason", "")) for _, request in accepted],
+            original_pages=[by_page[page_number] for page_number, _ in accepted],
+        )
+        return refined, unresolved, supplemental_records
 
     def _call_report(
         self,
@@ -579,12 +687,13 @@ class Reader:
                 f"Request budget exhausted for {paper_id}: maximum "
                 f"{self.config.max_requests_per_paper} requests per paper"
             )
+        schema_obj = schema if schema is not None else self._load_schema()
         messages = self._build_messages(
             paper_id=paper_id,
             pages=pages,
             title=title,
             prompt=prompt,
-            schema=schema,
+            schema=schema_obj,
             candidate=candidate,
             visual_reasons=visual_reasons,
             original_pages=original_pages,
@@ -616,6 +725,7 @@ class Reader:
         for attempt in range(1, max_attempts + 1):
             record.attempts = attempt
             self._request_count += 1
+            response: Any = None
             try:
                 response = self._create_completion(messages)
                 # Capture provider metadata even when the content is
@@ -624,7 +734,18 @@ class Reader:
                 record.response_id = _response_attr(response, "id")
                 record.finish_reason = _finish_reason(response)
                 record.usage = _usage_dict(_response_attr(response, "usage"))
-                report = self._parse_response(response)
+                report = self._parse_response(response, schema_obj)
+                # Reconciled before the schema check: an unusable visual
+                # request must be recorded, not repaired away.
+                _normalize_report(report)
+                parsed = report
+                report = self._repair_schema_errors(
+                    report, schema=schema_obj, paper_id=paper_id, call_type=call_type
+                )
+                # Identity, not a counter: a repair round that ran but whose
+                # result was rejected leaves the parsed report in place, and
+                # that report must not be labelled as repaired.
+                record.format_repaired = report is not parsed
                 record.ended_at = _now()
                 record.duration_s = round(time.monotonic() - started, 3)
                 self._emit(
@@ -637,14 +758,47 @@ class Reader:
                         "response_id": record.response_id,
                         "finish_reason": record.finish_reason,
                         "usage": record.usage,
+                        "format_repaired": record.format_repaired,
                         "duration_s": record.duration_s,
                         "ended_at": record.ended_at,
                     }
                 )
                 return _ResponseResult(report=report, response=response, record=record)
             except ReaderResponseError as exc:
-                # Malformed/truncated output is a failed logical call.  It is
-                # generally not fixed by resending the same large prompt.
+                # Malformed output is not fixed by resending the same large
+                # prompt, but it is often fixed by one text-only repair round
+                # that never re-uploads the page images.  An output that holds
+                # no report content is the opposite case: no repair is possible
+                # (see _parse_response), so it is left to the caller's retry,
+                # which does pay for the images again.
+                retryable = bool(getattr(exc, "retryable_with_images", False))
+                repaired = (
+                    self._repair_unparsable(
+                        exc, schema=schema_obj, paper_id=paper_id, call_type=call_type
+                    )
+                    if response is not None
+                    else None
+                )
+                if repaired is not None:
+                    record.ended_at = _now()
+                    record.duration_s = round(time.monotonic() - started, 3)
+                    record.format_repaired = True
+                    self._emit(
+                        {
+                            "event": "call_finished",
+                            "call_type": call_type,
+                            "request_id": request_id,
+                            "model": self.config.model,
+                            "attempts": attempt,
+                            "response_id": record.response_id,
+                            "finish_reason": record.finish_reason,
+                            "usage": record.usage,
+                            "format_repaired": True,
+                            "duration_s": record.duration_s,
+                            "ended_at": record.ended_at,
+                        }
+                    )
+                    return _ResponseResult(report=repaired, response=response, record=record)
                 record.error_type = type(exc).__name__
                 record.error = _safe_error(exc)
                 record.ended_at = _now()
@@ -661,7 +815,7 @@ class Reader:
                         "usage": record.usage,
                         "error_type": record.error_type,
                         "error": record.error,
-                        "retryable": False,
+                        "retryable": retryable,
                         "duration_s": record.duration_s,
                         "ended_at": record.ended_at,
                     }
@@ -709,11 +863,177 @@ class Reader:
         # future change to retry policy fail loudly rather than return nothing.
         raise ReaderAPIError(f"{call_type} call failed: {last_error}") from last_error
 
+    def _repair_schema_errors(
+        self,
+        report: dict[str, Any],
+        *,
+        schema: Mapping[str, Any] | None,
+        paper_id: str,
+        call_type: str,
+    ) -> dict[str, Any]:
+        """Give the model one text-only chance to fix a structurally invalid report.
+
+        Only shape is repaired here.  Semantic checks (unknown evidence IDs,
+        dangling method edges, numbers that contradict a page) are deliberately
+        left to ``validate.py`` and to human review, and truncated output is
+        never treated as a formatting problem.
+        """
+
+        errors = schema_errors(report, schema)
+        if not errors:
+            return report
+        repaired = self._request_repair(
+            reason="模型返回的 JSON 不符合 report schema，请修正结构。",
+            errors=errors,
+            payload=json.dumps(report, ensure_ascii=False),
+            schema=schema,
+            paper_id=paper_id,
+            call_type=call_type,
+        )
+        if repaired is None:
+            return report
+        if schema_errors(repaired, schema):
+            # A repair that is still invalid is not an improvement; keep the
+            # original so the failure is reported against the real output.
+            return report
+        # The schema cannot express every problem (a crop with no area passes
+        # it), so the repaired report is reconciled as well.
+        _normalize_report(repaired)
+        return repaired
+
+    def _repair_unparsable(
+        self,
+        error: ReaderResponseError,
+        *,
+        schema: Mapping[str, Any] | None,
+        paper_id: str,
+        call_type: str,
+    ) -> dict[str, Any] | None:
+        """Try one text-only repair of a response whose JSON could not be parsed."""
+
+        raw = error.raw_content
+        if not error.repairable or not isinstance(raw, str) or not raw.strip():
+            return None
+        repaired = self._request_repair(
+            reason="上一次输出不是可解析的 JSON 对象，请把同样的内容重新输出为合法 JSON。",
+            errors=[_safe_error(error)],
+            payload=raw,
+            schema=schema,
+            paper_id=paper_id,
+            call_type=call_type,
+        )
+        if repaired is None:
+            return None
+        if schema_errors(repaired, schema):
+            return None
+        _normalize_report(repaired)
+        return repaired
+
+    def _request_repair(
+        self,
+        *,
+        reason: str,
+        errors: Sequence[str],
+        payload: str,
+        schema: Mapping[str, Any] | None,
+        paper_id: str,
+        call_type: str,
+    ) -> dict[str, Any] | None:
+        """Send one repair-sized request without any page image.
+
+        The repair call is a real request: it is counted against the per-paper
+        budget and is skipped once the repair budget is used up.  A failed
+        repair never replaces the original error with a vaguer one.
+        """
+
+        if self._format_repairs_used >= self.config.max_format_repairs:
+            return None
+        if self._request_count >= self.config.max_requests_per_paper:
+            self._emit(
+                {
+                    "event": "repair_skipped",
+                    "call_type": call_type,
+                    "paper_id": paper_id,
+                    "reason": "request budget exhausted",
+                }
+            )
+            return None
+        self._format_repairs_used += 1
+        self._request_count += 1
+
+        parts = [
+            "本次不提供任何页面图片，只做结构修复。不要新增、删除或改写事实、数字、"
+            "证据条目与方法关系；只修正 JSON 结构与字段类型，其它内容保持原样。",
+            f"paper_id: {paper_id}",
+            reason,
+            "本地校验发现的问题：\n" + "\n".join(f"- {item}" for item in errors[:20]),
+        ]
+        if schema:
+            parts.append(
+                "必须符合的 JSON Schema：\n"
+                + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            )
+        parts.append("待修复的内容：\n" + payload[:80_000])
+
+        request_id = uuid4().hex
+        started = time.monotonic()
+        self._emit(
+            {
+                "event": "repair_started",
+                "call_type": call_type,
+                "request_id": request_id,
+                "paper_id": paper_id,
+                "model": self.config.model,
+                "errors": list(errors[:20]),
+            }
+        )
+        try:
+            response = self._create_completion(
+                [
+                    {
+                        "role": "system",
+                        "content": "Return valid JSON only. Do not add content that was not already present.",
+                    },
+                    {"role": "user", "content": [{"type": "text", "text": "\n\n".join(parts)}]},
+                ]
+            )
+            content = _message_content(response)
+            if content is None or not str(content).strip():
+                raise ReaderResponseError("repair response contained no content")
+            repaired = parse_json_object(str(content))
+        except Exception as exc:  # noqa: BLE001 - repair failure is not fatal
+            self._emit(
+                {
+                    "event": "repair_failed",
+                    "call_type": call_type,
+                    "request_id": request_id,
+                    "paper_id": paper_id,
+                    "error_type": type(exc).__name__,
+                    "error": _safe_error(exc),
+                }
+            )
+            return None
+        self._emit(
+            {
+                "event": "repair_finished",
+                "call_type": call_type,
+                "request_id": request_id,
+                "paper_id": paper_id,
+                "duration_s": round(time.monotonic() - started, 3),
+                "usage": _usage_dict(_response_attr(response, "usage")),
+            }
+        )
+        return repaired
+
     def _create_completion(self, messages: list[dict[str, Any]]) -> Any:
         kwargs: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
         }
+        if self.config.max_output_tokens is not None:
+            # Leave enough room for a complete report.  The endpoint default is
+            # frequently smaller than one report, which truncates the JSON.
+            kwargs["max_tokens"] = self.config.max_output_tokens
         if self.config.response_mode.lower() in {"json", "json_object", "auto_validated_json", "auto"}:
             kwargs["response_format"] = {"type": "json_object"}
         if self.config.thinking is not None:
@@ -752,15 +1072,30 @@ class Reader:
             instructions,
             f"paper_id: {paper_id}",
             f"title: {title}" if title else "title: (read from supplied pages)",
-            f"The following images are the complete input for this call. PDF pages: {coverage}.",
-            "Treat each PDF_PAGE label immediately before an image as authoritative evidence identity.",
         ]
+        if candidate is None:
+            text_parts.append(
+                f"The following images are the complete input for this call. PDF pages: {coverage}."
+            )
+        else:
+            text_parts.append(
+                "This is a visual refinement round, not a first reading. The following original "
+                f"pages and enlarged crops are re-sent for verification only: PDF pages {coverage}. "
+                "The remaining pages of this paper were supplied in the first call; do not treat "
+                "them as missing material, and do not rewrite content that these images do not "
+                "change. Keep the candidate report complete: return every section, not only the "
+                "revised parts."
+            )
+        text_parts.append(
+            "Treat each PDF_PAGE label immediately before an image as authoritative evidence identity. "
+            "IMAGE_ID values name the exact image supplied, including crops; an evidence entry may "
+            "cite the crop it was read from."
+        )
         if schema_text:
             text_parts.append("Return one JSON object conforming to this JSON Schema:\n" + schema_text)
         if candidate is not None:
             text_parts.extend(
                 [
-                    "This is a visual refinement round. Revise the candidate report only where the new images add evidence. Preserve correct content and return the complete report object again.",
                     "Reasons for requesting visual review:\n" + "\n".join(f"- {reason}" for reason in visual_reasons if reason),
                     "Candidate report JSON:\n" + json.dumps(candidate, ensure_ascii=False),
                 ]
@@ -810,21 +1145,55 @@ class Reader:
             raise ReaderConfigError(f"Could not read reader prompt {path}: {exc}") from exc
         return value or DEFAULT_READER_INSTRUCTIONS
 
-    def _parse_response(self, response: Any) -> dict[str, Any]:
+    def _load_refine_prompt(self) -> str:
+        """Load the refinement instructions, falling back to the built-in ones."""
+
+        path = self.refine_prompt_path
+        if path is None and self.prompt_path is not None:
+            sibling = self.prompt_path.parent / "refine.md"
+            path = sibling if sibling.exists() else None
+        if path is None:
+            candidate = Path.cwd() / "prompts" / "refine.md"
+            path = candidate if candidate.exists() else None
+        if path is None:
+            return DEFAULT_REFINE_INSTRUCTIONS
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ReaderConfigError(f"Could not read refine prompt {path}: {exc}") from exc
+        return value or DEFAULT_REFINE_INSTRUCTIONS
+
+    def _parse_response(
+        self, response: Any, schema: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         finish_reason = _finish_reason(response)
         if finish_reason in {"length", "max_tokens", "content_filter"}:
+            # Truncated output is missing content, not misformatted content;
+            # a repair round would only ask the model to invent the rest.
             raise ReaderResponseError(
                 f"Model response ended with finish_reason={finish_reason}; report is not complete"
             )
         content = _message_content(response)
         if content is None or not str(content).strip():
-            raise ReaderResponseError("Model response did not contain message.content JSON")
+            # Nothing visible at all, so there is no payload to reformat.
+            raise _no_report_error("Model response did not contain message.content JSON")
         try:
             parsed = parse_json_object(str(content))
         except ValueError as exc:
-            raise ReaderResponseError(f"Model response is not valid JSON: {exc}") from exc
+            if _carries_no_report(str(content), schema):
+                raise _no_report_error(f"Model response is not valid JSON: {exc}") from exc
+            error = ReaderResponseError(f"Model response is not valid JSON: {exc}")
+            # The raw text is the only repair input available for this case.
+            error.raw_content = str(content)
+            error.repairable = True
+            raise error from exc
         if "report" in parsed and isinstance(parsed["report"], Mapping) and len(parsed) == 1:
             parsed = dict(parsed["report"])
+        if _carries_no_report(parsed, schema):
+            # A JSON object that holds nothing report-shaped is the same
+            # accident as `[]`, and the schema repair would write the report
+            # from nothing the same way.
+            raise _no_report_error("Model response JSON holds no report content")
         return parsed
 
     def _emit(self, event: Mapping[str, Any]) -> None:
@@ -910,14 +1279,61 @@ def image_data_uri(path: str | os.PathLike[str]) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def parse_json_object(value: str) -> dict[str, Any]:
-    """Parse JSON from a provider response, accepting one Markdown fence."""
+def _strip_fence(value: str) -> str:
+    """Drop the one Markdown fence providers like to wrap JSON in."""
 
     text = value.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text, count=1)
         text = text.strip()
+    return text
+
+
+def _no_report_error(message: str) -> ReaderResponseError:
+    """A response error that only a fresh attempt with the images can fix."""
+
+    error = ReaderResponseError(message)
+    error.retryable_with_images = True
+    return error
+
+
+def _carries_no_report(value: Any, schema: Mapping[str, Any] | None) -> bool:
+    """True when a payload cannot be a report that merely needs reformatting.
+
+    Separates "malformed report" from "no report at all".  Text that is not
+    parseable JSON is *not* substance-free: the raw text is real content, and a
+    repair round can re-emit it as JSON.  Anything else that shares no key with
+    the report's required fields is substance-free, and repairing it would mean
+    writing a report from nothing.  Accepts raw text or an already-parsed value.
+    """
+
+    if isinstance(value, Mapping):
+        parsed: Any = value
+    else:
+        text = _strip_fence(str(value)).strip()
+        if not text:
+            return True
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+    if isinstance(parsed, Mapping) and len(parsed) == 1 and isinstance(parsed.get("report"), Mapping):
+        # The same unwrapping _parse_response does, so `{"report": {}}` counts
+        # as empty rather than as one filled-in field.
+        parsed = parsed["report"]
+    if not isinstance(parsed, Mapping):
+        return True
+    required = schema.get("required") if isinstance(schema, Mapping) else None
+    if not isinstance(required, Sequence) or not required:
+        return not parsed
+    return not (set(parsed) & {str(key) for key in required})
+
+
+def parse_json_object(value: str) -> dict[str, Any]:
+    """Parse JSON from a provider response, accepting one Markdown fence."""
+
+    text = _strip_fence(value)
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
@@ -931,6 +1347,32 @@ def parse_json_object(value: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("top-level JSON value must be an object")
     return parsed
+
+
+def schema_errors(report: Any, schema: Mapping[str, Any] | None) -> list[str]:
+    """Return local JSON-Schema problems for a report, or ``[]`` when unseen.
+
+    The check is best-effort: without ``jsonschema`` or a schema the caller
+    simply keeps whatever the model returned, and the batch-level validator
+    reports the problem in the usual way.
+    """
+
+    if not schema:
+        return []
+    try:
+        from jsonschema import Draft202012Validator  # type: ignore
+    except ImportError:  # pragma: no cover - dependency is installed with the project
+        return []
+    try:
+        validator = Draft202012Validator(dict(schema))
+        found = sorted(validator.iter_errors(report), key=lambda item: list(item.path))
+    except Exception:  # noqa: BLE001 - an unusable schema must not break reading
+        return []
+    errors: list[str] = []
+    for error in found[:20]:
+        location = "$" + "".join(f"/{part}" for part in error.path)
+        errors.append(f"{location}: {error.message}")
+    return errors
 
 
 def validate_visual_request(
@@ -1082,6 +1524,36 @@ def _visual_requests(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [dict(value) for value in values if isinstance(value, Mapping)] if isinstance(values, list) else []
 
 
+def _sanitize_visual_requests(report: MutableMapping[str, Any]) -> None:
+    """Move visual requests that can never be rendered into ``unresolved_items``.
+
+    A request with a null or non-integer page, or with a crop that has no area,
+    is not something a later round can act on -- and it is also a schema
+    violation, so leaving it in the report would buy a whole-report format
+    repair that is allowed to drop the entry.  Dropping it here keeps the fact
+    that the model wanted a closer look, at no extra request.
+
+    Shape only: whether the page really exists is decided later, against the
+    pages actually available to the follow-up call.
+    """
+
+    values = report.get("visual_requests")
+    if not isinstance(values, list):
+        return
+    kept: list[Any] = []
+    rejected: list[str] = []
+    for value in values:
+        valid, reason = validate_visual_request(value, None)
+        if valid:
+            kept.append(value)
+        else:
+            rejected.append(f"已忽略无法执行的补看请求：{reason}")
+    if not rejected:
+        return
+    report["visual_requests"] = kept
+    _append_unresolved_to_report(report, rejected)
+
+
 def _append_unresolved_to_report(report: MutableMapping[str, Any], items: Iterable[str]) -> None:
     existing = report.get("unresolved_items")
     if not isinstance(existing, list):
@@ -1090,6 +1562,174 @@ def _append_unresolved_to_report(report: MutableMapping[str, Any], items: Iterab
     for item in items:
         if item and item not in existing:
             existing.append(item)
+
+
+def _mappings(value: Any) -> list[Mapping[str, Any]]:
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _unresolved_texts(report: Mapping[str, Any]) -> list[str]:
+    values = report.get("unresolved_items")
+    if not isinstance(values, list):
+        return []
+    return [text for text in (str(value) for value in values) if text]
+
+
+def _merge_carried(result: ReadResult, items: Sequence[str]) -> None:
+    """Keep pre-refinement unresolved items in the delivered report and result."""
+
+    if not items:
+        return
+    _append_unresolved_to_report(result.report, items)
+    for item in items:
+        if item not in result.unresolved_items:
+            result.unresolved_items.append(item)
+
+
+def _carryable_unresolved(report: Mapping[str, Any]) -> list[str]:
+    """Items worth carrying into a refined report.
+
+    Derived items are left out: they are recomputed from the refined report, so
+    carrying them would re-flag a relation the model just confirmed, or a
+    request the refinement round has since executed.
+    """
+
+    return [item for item in _unresolved_texts(report) if not item.startswith(DERIVED_PREFIXES)]
+
+
+def _record_unconfirmed_edges(report: MutableMapping[str, Any]) -> None:
+    """List every relation the method diagram had to leave out.
+
+    The reader prompt requires a relation without evidence to be marked
+    ``confirmed: false`` *and* listed in ``unresolved_items``; the diagram then
+    omits it.  Recomputing that list from the report keeps the promise when the
+    model forgets, and keeps it correct when a refinement round confirms the
+    relation after all.
+    """
+
+    method = report.get("method")
+    names: dict[str, str] = {}
+    if isinstance(method, Mapping):
+        for node in _mappings(method.get("nodes")):
+            node_id = node.get("id")
+            if isinstance(node_id, str):
+                names[node_id] = str(node.get("name") or node_id)
+    derived: list[str] = []
+    for edge in _mappings(method.get("edges") if isinstance(method, Mapping) else None):
+        # Mirrors render_mermaid: anything that is not confirmed is omitted.
+        if edge.get("confirmed") is True:
+            continue
+        source = str(edge.get("from", "?"))
+        target = str(edge.get("to", "?"))
+        derived.append(
+            f"{UNCONFIRMED_EDGE_PREFIX}{names.get(source, source)} → {names.get(target, target)}"
+            f"（{edge.get('relation', 'relation')}）未获证据确认，已从方法图中省略"
+        )
+    _recompute_derived(report, UNCONFIRMED_EDGE_PREFIX, derived)
+
+
+def _finalize(result: ReadResult) -> ReadResult:
+    """Make ``unresolved_items`` agree with the report that is returned."""
+
+    result.unresolved_items = _unresolved_texts(result.report)
+    return result
+
+
+def _request_key(request: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Identify a crop request closely enough to recognise an echoed copy.
+
+    The refinement prompt tells the model to output the whole report and to
+    leave untouched parts alone, so a request that was just executed tends to
+    come back verbatim.  Comparing page and crop -- with crops rounded, because
+    a model may echo ``0.5200000000000001`` for ``0.52`` -- lets the reader
+    tell that echo apart from a genuinely new request.
+    """
+
+    page = request.get("pdf_page")
+    crop = request.get("crop")
+    if not isinstance(crop, Mapping):
+        return (page, None)
+    coordinates: list[Any] = []
+    for name in ("x0", "y0", "x1", "y1"):
+        value = crop.get(name)
+        coordinates.append(
+            round(float(value), 4)
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else str(value)
+        )
+    return (page, tuple(coordinates))
+
+
+def _executed_request_keys(supplemental: Sequence[Mapping[str, Any]]) -> set[tuple[Any, ...]]:
+    """Keys of the requests a refinement round actually rendered an image for."""
+
+    return {_request_key(item) for item in supplemental}
+
+
+def _request_line(item: Mapping[str, Any]) -> str:
+    return (
+        f"PDF 第 {item.get('pdf_page', '?')} 页"
+        f"（{_text_value(item.get('reason')) or '未说明原因'}）"
+    )
+
+
+def _record_pending_requests(
+    report: MutableMapping[str, Any], executed: Container[Any] = ()
+) -> None:
+    """List every visual request still sitting in the report without an image.
+
+    A request that reached the delivered report was never looked at: the
+    refinement round either rewrites the list or leaves it behind.  Recording
+    them here is what keeps ``needs_review`` from appearing above an empty
+    pending list.
+
+    ``executed`` holds the keys of the requests this round did render.  A
+    request that comes back in the revised report although its crop was just
+    sent is not pending -- it was looked at and the question survived the look
+    -- so it is reported as unresolved instead of unexecuted.  Without that
+    distinction the model's habit of echoing the candidate's request list would
+    turn a successful refinement round into four phantom "未能执行" items.
+    """
+
+    pending: list[str] = []
+    still_open: list[str] = []
+    for item in _mappings(report.get("visual_requests")):
+        line = _request_line(item)
+        if _request_key(item) in executed:
+            still_open.append(f"{REFINED_UNRESOLVED_PREFIX}{line}")
+        else:
+            pending.append(f"{PENDING_REQUEST_PREFIX}{line}")
+    _recompute_derived(report, PENDING_REQUEST_PREFIX, pending)
+    _recompute_derived(report, REFINED_UNRESOLVED_PREFIX, still_open)
+
+
+def _recompute_derived(report: MutableMapping[str, Any], prefix: str, derived: Sequence[str]) -> None:
+    """Replace one group of derived items with a freshly computed list.
+
+    Replacing rather than appending keeps a stale item from outliving the state
+    it described -- a relation the refinement round confirmed, or a request it
+    executed -- including when the model echoes the old list back verbatim.
+    """
+
+    existing = _unresolved_texts(report)
+    kept = [item for item in existing if not item.startswith(prefix)]
+    if len(kept) == len(existing) and not derived:
+        return
+    report["unresolved_items"] = kept + [item for item in derived if item not in kept]
+
+
+def _text_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _normalize_report(
+    report: MutableMapping[str, Any], executed: Container[Any] = ()
+) -> None:
+    """Reconcile a freshly parsed report with what the rest of the pipeline needs."""
+
+    _sanitize_visual_requests(report)
+    _record_unconfirmed_edges(report)
+    _record_pending_requests(report, executed)
 
 
 def _call_renderer(
@@ -1135,6 +1775,8 @@ def _now() -> str:
 __all__ = [
     "CallRecord",
     "DEFAULT_MODEL",
+    "DEFAULT_READER_INSTRUCTIONS",
+    "DEFAULT_REFINE_INSTRUCTIONS",
     "EventRecorder",
     "JsonlEventRecorder",
     "PageImage",
@@ -1152,5 +1794,6 @@ __all__ = [
     "normalize_page",
     "normalize_pages",
     "parse_json_object",
+    "schema_errors",
     "validate_visual_request",
 ]

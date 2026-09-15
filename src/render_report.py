@@ -167,13 +167,15 @@ def _page_image_map(
     report_path: Path,
     pages_json: Path | None = None,
     pages: Sequence[Mapping[str, Any]] | None = None,
+    supplemental_images: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Path]:
     """Map page/image IDs to absolute paths.
 
     Several field names are accepted because pages.json is an interchange
     artifact and early preprocess versions used ``path`` while later versions
     use ``image_path``.  Relative paths are always resolved against
-    pages.json's directory.
+    pages.json's directory.  ``supplemental_images`` adds the crops and
+    re-rendered pages of a refinement round, whose paths are usually absolute.
     """
 
     pages_path = pages_json.resolve() if pages_json is not None else None
@@ -207,6 +209,19 @@ def _page_image_map(
             str(page_number),
         }
         for identifier in identifiers:
+            if identifier:
+                result.setdefault(identifier, image_path)
+    for image in supplemental_images or []:
+        if not isinstance(image, Mapping):
+            continue
+        value = image.get("path", image.get("image_path"))
+        if not value:
+            continue
+        image_path = Path(_text(value))
+        if not image_path.is_absolute():
+            image_path = base / image_path
+        image_path = image_path.resolve()
+        for identifier in (_text(image.get("image_id")), _text(image.get("id")), image_path.name):
             if identifier:
                 result.setdefault(identifier, image_path)
     return result
@@ -279,7 +294,12 @@ def _render_related_work(lines: list[str], related: Sequence[Any]) -> None:
     lines.append("")
 
 
-def _render_method(lines: list[str], method: Mapping[str, Any], include_mermaid: bool) -> list[str]:
+def _render_method(
+    lines: list[str],
+    method: Mapping[str, Any],
+    include_mermaid: bool,
+    include_method_steps: bool = True,
+) -> list[str]:
     warnings: list[str] = []
     lines.extend(["## Q3. 方法", ""])
     if method.get("applicable") is False:
@@ -308,22 +328,23 @@ def _render_method(lines: list[str], method: Mapping[str, Any], include_mermaid:
         lines.append("")
 
     steps = [item for item in _items(method.get("steps")) if isinstance(item, Mapping)]
-    lines.extend(["### 方法步骤", ""])
-    if steps:
-        lines.extend(["| Step | Input | Operation | Tool / Model | Output | Why Needed | Evidence |", "| --- | --- | --- | --- | --- | --- | --- |"])
-        for step in steps:
-            lines.append("| " + " | ".join([
-                _md_cell(step.get("step")),
-                _md_cell(step.get("input")),
-                _md_cell(step.get("operation")),
-                _md_cell(step.get("tool_or_model")),
-                _md_cell(step.get("output")),
-                _md_cell(step.get("why_needed")),
-                _md_cell(_evidence_refs(step.get("evidence_ids"))),
-            ]) + " |")
-    else:
-        lines.append("未提供。")
-    lines.append("")
+    if include_method_steps:
+        lines.extend(["### 方法步骤", ""])
+        if steps:
+            lines.extend(["| Step | Input | Operation | Tool / Model | Output | Why Needed | Evidence |", "| --- | --- | --- | --- | --- | --- | --- |"])
+            for step in steps:
+                lines.append("| " + " | ".join([
+                    _md_cell(step.get("step")),
+                    _md_cell(step.get("input")),
+                    _md_cell(step.get("operation")),
+                    _md_cell(step.get("tool_or_model")),
+                    _md_cell(step.get("output")),
+                    _md_cell(step.get("why_needed")),
+                    _md_cell(_evidence_refs(step.get("evidence_ids"))),
+                ]) + " |")
+        else:
+            lines.append("未提供。")
+        lines.append("")
 
     details = [item for item in _items(method.get("implementation_details")) if isinstance(item, Mapping)]
     lines.extend(["### 关键实现细节", ""])
@@ -423,48 +444,81 @@ def _render_evidence(
     return linked
 
 
+def _render_unresolved(lines: list[str], report: Mapping[str, Any]) -> None:
+    """Render the pending-review list that the header status refers to."""
+
+    items = [_text(item).strip() for item in _items(report.get("unresolved_items"))]
+    items = [item for item in items if item]
+    lines.extend(["## 待核查事项", ""])
+    lines.extend([f"- {item}" for item in items] or ["无。"])
+    lines.append("")
+
+
 def render_report(
     report: Mapping[str, Any],
     output_path: str | os.PathLike[str],
     *,
     pages_json: str | os.PathLike[str] | None = None,
     pages: Sequence[Mapping[str, Any]] | None = None,
+    supplemental_images: Sequence[Mapping[str, Any]] | None = None,
     metadata: Mapping[str, Any] | None = None,
     include_mermaid: bool = True,
+    include_method_steps: bool = True,
+    include_evidence_index: bool = True,
 ) -> RenderResult:
     """Render ``report`` to ``output_path`` atomically.
 
     ``pages_json`` should be supplied whenever the destination is outside the
     run directory.  The paths in it are interpreted relative to pages.json,
     and are then converted into links relative to the Markdown destination.
+    ``supplemental_images`` describes the crops supplied during one visual
+    refinement round so their evidence entries link to the crop itself.
     """
 
     destination = Path(output_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     pages_path = Path(pages_json).expanduser() if pages_json is not None else None
-    image_map = _page_image_map(destination, pages_path, pages)
-    lines: list[str] = []
+    image_map = _page_image_map(destination, pages_path, pages, supplemental_images)
+    head: list[str] = []
     title = _text(report.get("title"), report.get("paper_id", "Paper report"))
-    lines.extend([f"# {title}", ""])
+    head.extend([f"# {title}", ""])
     paper_id = _text(report.get("paper_id"), "unknown")
-    lines.append(f"- **Paper ID:** `{paper_id}`")
+    head.append(f"- **Paper ID:** `{paper_id}`")
     if metadata:
         status = metadata.get("status")
         if status:
-            lines.append(f"- **Status:** `{_text(status)}`")
+            head.append(f"- **Status:** `{_text(status)}`")
         coverage = metadata.get("input_coverage") or metadata.get("coverage")
         if coverage:
-            lines.append(f"- **Input coverage:** {_text(coverage)}")
+            head.append(f"- **Input coverage:** {_text(coverage)}")
         run_id = metadata.get("run_id")
         if run_id:
-            lines.append(f"- **Run:** `{_text(run_id)}`")
-    lines.extend(["", "## 摘要", "", _text(report.get("short_summary"), "未提供"), ""])
+            head.append(f"- **Run:** `{_text(run_id)}`")
+        if metadata.get("format_repaired"):
+            head.append(
+                "- **Provenance:** 本报告由一轮纯文本结构修复生成（修复时没有重新提供页面图片），"
+                "内容可能被重构；引用与数字请对照证据逐条核对。"
+            )
+    head.append("")
+
+    # The pending-review list belongs in the opening block: the status in the
+    # header is only meaningful next to the reasons for it.
+    _render_unresolved(head, report)
+
+    # The body is rendered separately so the opening block can be assembled
+    # before it, and so the render warnings it produces stay out of the file.
+    lines: list[str] = ["## 摘要", "", _text(report.get("short_summary"), "未提供"), ""]
 
     problem = report.get("problem")
     _render_problem(lines, problem if isinstance(problem, Mapping) else {})
     _render_related_work(lines, _items(report.get("related_work")))
     method = report.get("method")
-    warnings = _render_method(lines, method if isinstance(method, Mapping) else {}, include_mermaid)
+    warnings = _render_method(
+        lines,
+        method if isinstance(method, Mapping) else {},
+        include_mermaid,
+        include_method_steps,
+    )
     _render_experiments(lines, _items(report.get("experiments")))
 
     lines.extend(["## Q5. 局限与展望", "", "### 作者明确报告的局限 / 未来工作", ""])
@@ -507,12 +561,11 @@ def render_report(
         lines.append("无。")
     lines.append("")
 
-    linked = _render_evidence(lines, _items(report.get("evidence")), destination, image_map)
-    unresolved = [_text(item).strip() for item in _items(report.get("unresolved_items")) if _text(item).strip()]
-    lines.extend(["## 待核查事项", ""])
-    lines.extend([f"- {item}" for item in unresolved] or ["无。"])
-    lines.extend(["", "---", "", "由 `report.json` 确定性生成；`done` 不代表事实已经独立核查。", ""])
+    linked = 0
+    if include_evidence_index:
+        linked = _render_evidence(lines, _items(report.get("evidence")), destination, image_map)
 
+    lines = [*head, *lines, "", "---", "", "由 `report.json` 确定性生成；`done` 不代表事实已经独立核查。", ""]
     content = _join_lines(lines)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=str(destination.parent), text=True)
     try:

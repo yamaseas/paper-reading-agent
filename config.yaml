@@ -6,6 +6,13 @@ model:
   thinking: true
   response_mode: json_object
   request_timeout_s: 600
+  # 输出上限必须显式设置：端点默认值常常小于一份完整报告，会静默截断 JSON。
+  # 131072 是端点的硬上界，实测 200000 会被拒：
+  #   InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 131072]
+  # 该端点只按可见输出计算 max_tokens（探针：max_tokens=32 时可见文本截到 31 字符、
+  # finish_reason=length，而 completion_tokens 记 566），所以这个值是"不再有截断风险"，
+  # 而不是"每次都会产出这么多"。截断的响应不会被重试，也不会被当作格式问题修复。
+  max_output_tokens: 131072
 
 input:
   mode: full_page_images
@@ -15,6 +22,10 @@ input:
   image_max_pixels: 2621440
   extract_text: false
   on_input_over_limit: fail_with_reason
+  # 单篇页数上限，超过即 fail_with_reason（不渲染、不发送）。整篇按图片一次性上传，
+  # 图片占 prompt 的绝大部分：实测 46 页 109k prompt tokens，11-14 页 27k-44k。
+  # 设为 null 关闭护栏。
+  max_pages: 80
 
 refinement:
   max_visual_rounds: 1

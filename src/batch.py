@@ -23,12 +23,16 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .render_report import render_report
 
 
 DATE_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
+# The page ceiling applied when ``input.max_pages`` is absent.  Long conference
+# papers with appendices run past 40 pages; 80 leaves room for those while
+# still stopping a thesis-sized PDF before its images are rendered and sent.
+DEFAULT_MAX_PAGES = 80
 REPORT_KEYS = {
     "schema_version",
     "paper_id",
@@ -50,6 +54,10 @@ REPORT_KEYS = {
 
 class BatchError(RuntimeError):
     """An error that should be recorded in job.json."""
+
+
+class BatchPermanentError(BatchError):
+    """An error that a retry cannot fix, such as an exhausted request budget."""
 
 
 @dataclass(frozen=True)
@@ -263,11 +271,13 @@ def _reader_callable() -> Callable[..., Any]:
             event_recorder = kwargs.pop("event_recorder", None)
             schema_path = kwargs.pop("schema_path", None)
             prompt_path = kwargs.pop("prompt_path", None)
+            refine_prompt_path = kwargs.pop("refine_prompt_path", None)
             instance = reader_class(
                 config=config,
                 event_recorder=event_recorder,
                 schema_path=schema_path,
                 prompt_path=prompt_path,
+                refine_prompt_path=refine_prompt_path,
             )
             read_parameters = {
                 "paper_id": kwargs.get("paper_id"),
@@ -356,6 +366,7 @@ def _invoke_reader(
         "event_recorder": None,
         "schema_path": Path(__file__).resolve().parents[1] / "schemas" / "report.schema.json",
         "prompt_path": Path(__file__).resolve().parents[1] / "prompts" / "reader.md",
+        "refine_prompt_path": Path(__file__).resolve().parents[1] / "prompts" / "refine.md",
         "pages_json": preparation.get("pages_path", paper_dir / "pages.json"),
         "config": reader_config,
         "max_requests": max_requests,
@@ -398,6 +409,11 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
         unresolved = getattr(value, "unresolved_items", None)
         if isinstance(unresolved, Sequence) and not isinstance(unresolved, (str, bytes)):
             metadata["unresolved_items"] = list(unresolved)
+        supplemental = getattr(value, "supplemental_images", None)
+        if isinstance(supplemental, Sequence) and not isinstance(supplemental, (str, bytes)):
+            metadata["supplemental_images"] = [
+                dict(item) if isinstance(item, Mapping) else item for item in supplemental
+            ]
         raw_responses = getattr(value, "raw_responses", None)
         if isinstance(raw_responses, Sequence):
             raw_dir = run_dir / "raw"
@@ -420,19 +436,61 @@ def _extract_report(value: Any, run_dir: Path) -> tuple[dict[str, Any], Mapping[
     elif isinstance(value, (str, os.PathLike)):
         candidate = _load_json(Path(value))
     if isinstance(candidate, Mapping) and REPORT_KEYS.intersection(candidate.keys()):
-        return dict(candidate), metadata
+        report = dict(candidate)
+        _merge_unresolved(report, metadata.get("unresolved_items"))
+        return report, metadata
     report_path = run_dir / "report.json"
     if report_path.exists():
         loaded = _load_json(report_path)
         if isinstance(loaded, Mapping):
-            return dict(loaded), metadata
+            report = dict(loaded)
+            _merge_unresolved(report, metadata.get("unresolved_items"))
+            return report, metadata
     raise BatchError("reader did not return a report object or create run/report.json")
 
 
+def _merge_unresolved(report: dict[str, Any], items: Any) -> None:
+    """Keep refinement problems inside the report that is written to disk.
+
+    Status and the daily index are derived from ``report.json``, so an
+    unresolved item that lives only in the reader's return value would be
+    silently dropped from the delivered artifact.
+    """
+
+    if not items:
+        return
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        return
+    existing = report.get("unresolved_items")
+    if not isinstance(existing, list):
+        existing = []
+        report["unresolved_items"] = existing
+    for item in items:
+        text = str(item)
+        if text and text not in existing:
+            existing.append(text)
+
+
 def _validate_report(
-    report: Mapping[str, Any], config_path: Path, pages_path: Path | None = None
-) -> list[str]:
-    """Use src.validate when present, with a schema-only fallback."""
+    report: Mapping[str, Any],
+    config_path: Path,
+    pages_path: Path | None = None,
+    supplemental_images: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return ``(errors, warnings)`` for a report using src.validate when present.
+
+    Crops and re-rendered pages from the refinement round are passed as an
+    image-id mapping so evidence that cites a crop is checked against the page
+    it was cropped from instead of being rejected as an unknown image.
+    """
+
+    image_ids: dict[str, Any] | None = None
+    if supplemental_images:
+        image_ids = {
+            str(item.get("image_id") or item.get("id")): item.get("pdf_page")
+            for item in supplemental_images
+            if isinstance(item, Mapping) and (item.get("image_id") or item.get("id"))
+        }
 
     try:
         from . import validate
@@ -449,44 +507,82 @@ def _validate_report(
                 "report_path": None,
                 "schema_path": config_path.parent / "schemas" / "report.schema.json",
                 "pages": pages_path,
+                "image_ids": image_ids,
             }
             try:
                 result = _call_with_supported_kwargs(function, kwargs)
             except TypeError:
                 continue
+            # ``ValidationResult`` is a Mapping as well as an object, so the
+            # structured form has to be recognised before the mapping form.
+            if hasattr(result, "errors") and hasattr(result, "valid"):
+                if bool(getattr(result, "valid")):
+                    return [], [str(item) for item in getattr(result, "warnings", [])]
+                errors = [str(item) for item in getattr(result, "errors", [])]
+                warnings = [str(item) for item in getattr(result, "warnings", [])]
+                return errors, warnings
             if result is True or result is None:
-                return []
+                return [], []
             if isinstance(result, Mapping):
                 errors = result.get("errors", result.get("issues", []))
                 if not errors and result.get("valid") is True:
-                    return []
-                return [str(item) for item in (errors if isinstance(errors, list) else [errors])]
-            # ``src.validate.validate_report`` returns a ValidationResult
-            # object so callers can inspect warnings and schema/semantic
-            # status.  Treat its error collection as authoritative here.
-            if hasattr(result, "valid"):
-                if bool(getattr(result, "valid")):
-                    return []
-                errors = getattr(result, "errors", [])
-                return [str(item) for item in errors]
+                    return [], [str(item) for item in result.get("warnings", [])]
+                return [str(item) for item in (errors if isinstance(errors, list) else [errors])], []
             if isinstance(result, (list, tuple, set)):
-                return [str(item) for item in result]
+                return [str(item) for item in result], []
             if isinstance(result, str):
-                return [result]
-            return []
+                return [result], []
+            return [], []
     schema_path = config_path.parent / "schemas" / "report.schema.json"
     try:
         import jsonschema  # type: ignore
 
         schema = _load_json(schema_path)
         validator = jsonschema.Draft202012Validator(schema)
-        return [error.message for error in sorted(validator.iter_errors(report), key=lambda error: list(error.path))]
+        errors = [
+            error.message
+            for error in sorted(validator.iter_errors(report), key=lambda error: list(error.path))
+        ]
+        return errors, []
     except (ImportError, FileNotFoundError, json.JSONDecodeError):
         required = REPORT_KEYS - set(report)
-        return [f"missing required report fields: {', '.join(sorted(required))}"] if required else []
+        return (
+            [f"missing required report fields: {', '.join(sorted(required))}"] if required else [],
+            [],
+        )
 
 
 def _retryable(error: BaseException) -> bool:
+    """Decide whether re-sending the whole paper request could help.
+
+    A malformed or truncated model response is deliberately excluded: the same
+    prompt with the same images reproduces the same failure, and each attempt
+    pays for every page image again.  The reader already repairs malformed JSON
+    with a text-only call, so a response error that reaches this layer is not
+    worth a full re-read.
+
+    The exception is a response with no report content at all (`[]` after a long
+    reasoning pass, or an empty message).  Nothing can be reformatted there, and
+    the failure is a sampling accident rather than a property of the input, so
+    re-sending the images is the one thing that can still work.
+    """
+
+    if isinstance(error, BatchPermanentError):
+        return False
+    try:
+        from .reader import (
+            ReaderConfigError,
+            ReaderDependencyError,
+            ReaderInputError,
+            ReaderResponseError,
+        )
+    except ImportError:  # pragma: no cover - reader is part of this project
+        pass
+    else:
+        if isinstance(error, (ReaderConfigError, ReaderDependencyError, ReaderInputError, ReaderResponseError)):
+            # getattr, not attribute access: the three other error types carry
+            # no such flag.
+            return bool(getattr(error, "retryable_with_images", False))
     text = str(error).lower()
     permanent_markers = (
         "401",
@@ -495,11 +591,174 @@ def _retryable(error: BaseException) -> bool:
         "api key",
         "input_over_limit",
         "input over limit",
+        "context length",
+        "range of input length",
+        "exceeds the maximum",
         "unsupported parameter",
         "invalid parameter",
         "requires unsupported parameters",
+        "request budget exhausted",
     )
     return not any(marker in text for marker in permanent_markers)
+
+
+def _max_pages(config: Mapping[str, Any]) -> int | None:
+    """Page ceiling for a single paper, or ``None`` when the guard is off.
+
+    Every page is uploaded as an image, and images are almost the whole prompt:
+    46 pages measured 109k prompt tokens (~2.4k per page), against 27k-44k for
+    the 11-14 page papers in the same batch.  The ceiling exists so an oversized
+    PDF fails with a reason before its images are rendered and sent, instead of
+    being discovered through an endpoint rejection.
+    """
+
+    raw = _deep_get(config, "input", "max_pages", default=DEFAULT_MAX_PAGES)
+    if raw is None:
+        return None
+    value = _as_positive_int(raw, "input.max_pages")
+    return value
+
+
+def _as_positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise BatchError(f"{name} must be a positive integer or null, got {value!r}")
+    return value
+
+
+def _pdf_page_count(pdf_path: Path) -> int | None:
+    """Count the pages of a PDF without rendering any of them."""
+
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover - depends on the environment
+        return None
+    try:
+        with pymupdf.open(pdf_path) as document:
+            return int(document.page_count)
+    except Exception:  # noqa: BLE001 - the reader will report an unreadable PDF
+        return None
+
+
+def _input_over_limit(error: BaseException) -> bool:
+    """Recognise an endpoint rejection caused by the size of the input."""
+
+    text = str(error).lower()
+    markers = (
+        "context length",
+        "range of input length",
+        "input length",
+        "too many tokens",
+        "input_over_limit",
+        "input over limit",
+        "exceeds the maximum",
+        "maximum context",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _format_repaired(metadata: Mapping[str, Any]) -> bool:
+    """Whether any call of this run delivered a repair-round report."""
+
+    calls = metadata.get("calls")
+    if not isinstance(calls, Sequence) or isinstance(calls, (str, bytes)):
+        return bool(metadata.get("format_repaired"))
+    return any(
+        bool(call.get("format_repaired"))
+        for call in calls
+        if isinstance(call, Mapping)
+    )
+
+
+def _requests_made(value: Any) -> int:
+    """Count the provider requests a reader call actually issued.
+
+    ``ReadResult`` records one entry per logical call, including the visual
+    refinement round, so the per-paper budget is charged for what was really
+    sent rather than for one call per attempt.
+    """
+
+    calls = getattr(value, "calls", None)
+    if isinstance(calls, Sequence) and not isinstance(calls, (str, bytes)):
+        return max(1, len(calls))
+    if isinstance(value, Mapping):
+        for key in ("requests_made", "requests", "request_count"):
+            raw = value.get(key)
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+                return raw
+        nested = value.get("calls")
+        if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes)):
+            return max(1, len(nested))
+    return 1
+
+
+def _write_supplemental(run_dir: Path, images: Any) -> None:
+    """Record the crops of a refinement round next to the run's report."""
+
+    if not isinstance(images, Sequence) or isinstance(images, (str, bytes)):
+        return
+    entries = [dict(item) for item in images if isinstance(item, Mapping)]
+    if not entries:
+        return
+    _atomic_json(
+        run_dir / "supplemental.json",
+        {"schema_version": "1", "images": entries},
+    )
+
+
+def _read_supplemental(run_dir: Path) -> list[dict[str, Any]]:
+    path = run_dir / "supplemental.json"
+    if not path.exists():
+        return []
+    try:
+        value = _load_json(path)
+    except (json.JSONDecodeError, OSError):
+        return []
+    images = value.get("images", []) if isinstance(value, Mapping) else []
+    return [dict(item) for item in images if isinstance(item, Mapping)] if isinstance(images, list) else []
+
+
+def _render_options(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate ``output.*`` into renderer arguments."""
+
+    return {
+        "include_mermaid": bool(_deep_get(config, "output", "include_mermaid", default=True)),
+        "include_method_steps": bool(
+            _deep_get(config, "output", "include_method_steps", default=True)
+        ),
+        "include_evidence_index": bool(
+            _deep_get(config, "output", "include_evidence_index", default=True)
+        ),
+    }
+
+
+def _coverage_text(paper_dir: Path) -> str:
+    """Summarise what was actually fed to the reader, from metadata.json."""
+
+    metadata_path = paper_dir / "metadata.json"
+    if not metadata_path.exists():
+        return "未记录输入覆盖情况"
+    try:
+        metadata = _load_json(metadata_path)
+    except (json.JSONDecodeError, OSError):
+        return "未记录输入覆盖情况"
+    if not isinstance(metadata, Mapping):
+        return "未记录输入覆盖情况"
+    coverage = metadata.get("input_coverage")
+    total = metadata.get("total_pages")
+    if not isinstance(coverage, Mapping):
+        return f"全篇 {total} 页" if isinstance(total, int) else "未记录输入覆盖情况"
+    pages = coverage.get("pdf_pages")
+    numbers = [item for item in pages if isinstance(item, int)] if isinstance(pages, list) else []
+    if not numbers:
+        return f"全篇 {total} 页" if isinstance(total, int) else "未记录输入覆盖情况"
+    if numbers == list(range(1, len(numbers) + 1)):
+        text = f"全篇 {len(numbers)} 页（PDF 页序 1-{len(numbers)}）"
+    else:
+        text = f"{len(numbers)} 页（PDF 页序 {numbers[0]}-{numbers[-1]}，不连续）"
+    if coverage.get("complete") is False:
+        text += "；输入覆盖不完整"
+    text += "；未纳入 PDF 之外的补充材料"
+    return text
 
 
 def _read_job(path: Path) -> dict[str, Any]:
@@ -583,6 +842,18 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
     _event(run_dir, "job_started", paper_id=paper_id, run_id=run_fingerprint)
 
     try:
+        # Checked before anything is rendered: the endpoint rejects an oversized
+        # input anyway, but by then the images have been rendered and the reason
+        # arrives as an opaque provider error.
+        if not report_path.exists():
+            page_limit = _max_pages(config)
+            page_count = _pdf_page_count(pdf_path) if page_limit is not None else None
+            if page_count is not None and page_count > page_limit:
+                raise BatchPermanentError(
+                    "input_over_limit: PDF 有 "
+                    f"{page_count} 页，超过 input.max_pages={page_limit}；"
+                    "整篇会作为图片一次性上传，请拆分或调高上限后重跑"
+                )
         # A report left by an interrupted run is enough to resume from local
         # validation/rendering; no paid reader call is made in that case.
         preparation: Mapping[str, Any]
@@ -604,7 +875,9 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             total_attempts = options.max_retries + 1
             for attempt in range(1, total_attempts + 1):
                 if int(job.get("requests", 0)) >= options.max_requests_per_paper:
-                    raise BatchError("max_requests_per_paper reached before reader call")
+                    raise BatchPermanentError(
+                        "max_requests_per_paper reached before reader call"
+                    )
                 job["attempts"] = int(job.get("attempts", 0)) + 1
                 _update_job(job_path, job)
                 try:
@@ -616,12 +889,7 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
                         config,
                         options.max_requests_per_paper - int(job.get("requests", 0)),
                     )
-                    metadata = reader_result if isinstance(reader_result, Mapping) else {}
-                    request_count = metadata.get("requests_made", metadata.get("request_count", 1)) if isinstance(metadata, Mapping) else 1
-                    try:
-                        request_count = max(1, int(request_count))
-                    except (TypeError, ValueError):
-                        request_count = 1
+                    request_count = _requests_made(reader_result)
                     job["requests"] = int(job.get("requests", 0)) + request_count
                     _event(run_dir, "reader_succeeded", attempt=attempt, requests_made=request_count)
                     break
@@ -636,28 +904,64 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             if reader_result is None and last_error is not None:
                 raise last_error
             report, reader_metadata = _extract_report(reader_result, run_dir)
+            _write_supplemental(run_dir, reader_metadata.get("supplemental_images"))
             _atomic_json(report_path, report)
             _update_job(job_path, job, phase="validate")
 
         report = _load_json(report_path)
         if not isinstance(report, Mapping):
             raise BatchError("report.json root must be an object")
-        issues = _validate_report(report, options.config_path, paper_dir / "pages.json")
+        supplemental = _read_supplemental(run_dir)
+        issues, validation_warnings = _validate_report(
+            report, options.config_path, paper_dir / "pages.json", supplemental
+        )
         if issues:
             _update_job(job_path, job, status="failed", phase="validate", validation_errors=issues, error="report validation failed")
             _event(run_dir, "validation_failed", errors=issues)
             return PaperResult(paper_id, pdf_path, "failed", title=str(report.get("title", "")), report_path=report_path, job_path=job_path, error="report validation failed")
 
         pages_path = paper_dir / "pages.json"
-        render_metadata = {"status": "running", "run_id": run_fingerprint}
         _update_job(job_path, job, phase="render")
-        run_render = render_report(report, run_dir / "final.md", pages_json=pages_path, metadata=render_metadata)
+        unresolved = (
+            [str(item) for item in report.get("unresolved_items", [])]
+            if isinstance(report.get("unresolved_items"), list)
+            else []
+        )
+        # Requests that were never executed are listed by the reader itself
+        # (PENDING_REQUEST_PREFIX), so report.json stays the single source of
+        # the review reasons that this status is derived from.
+
+        output_options = _render_options(config)
+        render_kwargs = {
+            "pages_json": pages_path,
+            "supplemental_images": supplemental,
+            **output_options,
+        }
+        # The status is derived from the report alone, so the header, the
+        # pending list below it, the job record and the daily index always
+        # agree.  Render warnings are diagnostics about the drawing itself
+        # (a Mermaid-safe node ID, for instance) and are only recorded.
+        status = "needs_review" if unresolved else "done"
+        # A report that came out of a text-only repair round was restructured --
+        # or, when the repair payload carried no substance, written -- without
+        # any page image in front of the model.  That provenance has to travel
+        # with the report, because nothing in the report itself shows it.
+        repaired = _format_repaired(reader_metadata)
+        metadata = {
+            "status": status,
+            "run_id": run_fingerprint,
+            "input_coverage": _coverage_text(paper_dir),
+            "format_repaired": repaired,
+        }
+        run_render = render_report(
+            report, run_dir / "final.md", metadata=metadata, **render_kwargs
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_render = render_report(report, output_path, pages_json=pages_path, metadata={"status": "running", "run_id": run_fingerprint})
-        unresolved = [str(item) for item in report.get("unresolved_items", [])] if isinstance(report.get("unresolved_items"), list) else []
-        if report.get("visual_requests"):
-            unresolved = unresolved or ["报告请求了局部补看，但本批次尚未执行补看"]
-        status = "needs_review" if unresolved or run_render.warnings or output_render.warnings else "done"
+        output_render = render_report(
+            report, output_path, metadata=metadata, **render_kwargs
+        )
+        # Both copies render the same report, so their warnings are identical.
+        warnings = list(run_render.warnings)
         title = str(report.get("title", ""))
         summary = str(report.get("short_summary", ""))
         _update_job(
@@ -668,17 +972,37 @@ def process_one(pdf_path: Path, options: BatchOptions, config: Mapping[str, Any]
             title=title,
             summary=summary,
             unresolved_items=unresolved,
-            warnings=run_render.warnings + output_render.warnings,
+            warnings=warnings,
+            validation_warnings=validation_warnings,
             validation_errors=[],
+            output_coverage=metadata["input_coverage"],
+            format_repaired=repaired,
             completed_at=_now(),
         )
-        _event(run_dir, "job_completed", status=status, linked_images=run_render.linked_images)
+        _event(
+            run_dir,
+            "job_completed",
+            status=status,
+            linked_images=output_render.linked_images,
+            supplemental_images=len(supplemental),
+        )
         return PaperResult(paper_id, pdf_path, status, title, summary, report_path, output_path, job_path, unresolved)
     except Exception as exc:  # noqa: BLE001 - batch must continue with other papers
         error = f"{type(exc).__name__}: {exc}"
-        _update_job(job_path, job, status="failed", phase=job.get("phase", "unknown"), error=error, traceback=traceback.format_exc())
+        updates: dict[str, Any] = {
+            "status": "failed",
+            "phase": job.get("phase", "unknown"),
+            "error": error,
+            "traceback": traceback.format_exc(),
+        }
+        if _input_over_limit(exc):
+            # The plan requires a distinct, visible reason instead of a silent
+            # page drop or a truncated reading presented as complete.
+            updates["failure_reason"] = "input_over_limit"
+            updates["error"] = f"input_over_limit: {error}"
+        _update_job(job_path, job, **updates)
         _event(run_dir, "job_failed", error=error)
-        return PaperResult(paper_id, pdf_path, "failed", report_path=report_path if report_path.exists() else None, job_path=job_path, error=error)
+        return PaperResult(paper_id, pdf_path, "failed", report_path=report_path if report_path.exists() else None, job_path=job_path, error=str(updates["error"]))
 
 
 def _batch_date(input_path: Path, explicit: str | None = None) -> str:
@@ -772,8 +1096,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_unsupported_config(config: Mapping[str, Any]) -> None:
+    """Refuse configuration that V1 silently cannot honour.
+
+    The plan states that a setting which exists must take effect.  Anything
+    outside the implemented V1 behaviour fails loudly here instead of being
+    read, ignored, and mistaken for an applied policy.
+    """
+
+    language = _deep_get(config, "output", "language", default="zh-CN")
+    if str(language) != "zh-CN":
+        raise BatchError(
+            f"output.language={language!r} is not implemented; V1 writes zh-CN reports only"
+        )
+    if _deep_get(config, "input", "include_all_pdf_pages", default=True) is not True:
+        raise BatchError(
+            "input.include_all_pdf_pages=false is not implemented; V1 always sends every page "
+            "and fails with a reason instead of dropping pages"
+        )
+    over_limit = _deep_get(config, "input", "on_input_over_limit", default="fail_with_reason")
+    if str(over_limit) != "fail_with_reason":
+        raise BatchError(
+            f"input.on_input_over_limit={over_limit!r} is not implemented; V1 only supports "
+            "'fail_with_reason'"
+        )
+    if _deep_get(config, "verification", "automated_verifier", default=False) is not False:
+        raise BatchError(
+            "verification.automated_verifier=true is not implemented in V1; enable it only after "
+            "calibration shows a reproducible net benefit"
+        )
+    # Validated here as well as at use: a malformed page ceiling should stop the
+    # run once, not fail every paper in it with the same message.
+    _max_pages(config)
+
+
 def options_from_args(args: argparse.Namespace) -> BatchOptions:
     config = _load_yaml(args.config)
+    _check_unsupported_config(config)
     concurrency = args.concurrency if args.concurrency is not None else int(_deep_get(config, "batch", "concurrency", default=2))
     max_retries = args.max_retries if args.max_retries is not None else int(_deep_get(config, "batch", "max_retries_per_call", default=2))
     max_requests = args.max_requests_per_paper if args.max_requests_per_paper is not None else int(_deep_get(config, "batch", "max_requests_per_paper", default=6))

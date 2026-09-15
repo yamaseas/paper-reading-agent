@@ -124,6 +124,67 @@ def _page_rect(page: Any) -> Any:
         raise PreprocessError("PyMuPDF returned a page without a rectangle") from exc
 
 
+def _printed_page_labels(document: Any) -> list[str | None]:
+    """Return the printed page label for every page, when the PDF declares one.
+
+    The label comes from the PDF page-label structure, not from guessing at
+    text on the page.  PDFs without labels return ``None`` for every page,
+    which keeps the field honest instead of inventing a number.
+    """
+
+    getter = getattr(document, "get_page_labels", None)
+    if not callable(getter):
+        return []
+    try:
+        labels = getter()
+    except Exception:  # pragma: no cover - malformed label trees are not fatal
+        return []
+    if not isinstance(labels, list):
+        return []
+    total = len(document)
+    result: list[str | None] = [None] * total
+    try:
+        for entry in labels:
+            if not isinstance(entry, Mapping):
+                continue
+            start = int(entry.get("startpage", 0) or 0)
+            first = int(entry.get("firstpagenum", 1) or 1)
+            prefix = str(entry.get("prefix", "") or "")
+            style = str(entry.get("style", "D") or "D")
+            end = total
+            for other in labels:
+                if isinstance(other, Mapping) and int(other.get("startpage", -1) or -1) > start:
+                    end = min(end, int(other.get("startpage", total) or total))
+            for index in range(max(0, start), min(end, total)):
+                number = first + (index - start)
+                if style.upper() in {"D", ""}:
+                    result[index] = f"{prefix}{number}"
+                elif style.upper() == "R" or style.upper() == "r":
+                    result[index] = f"{prefix}{_roman(number, style.islower())}"
+                else:
+                    result[index] = None
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return []
+    return result
+
+
+def _roman(value: int, lower: bool = False) -> str:
+    if not 0 < value < 4000:
+        return str(value)
+    numerals = (
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+        (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    )
+    parts: list[str] = []
+    remaining = value
+    for amount, numeral in numerals:
+        while remaining >= amount:
+            parts.append(numeral)
+            remaining -= amount
+    text = "".join(parts)
+    return text.lower() if lower else text
+
+
 def _normalise_crop(crop: Mapping[str, Any] | Sequence[Any] | None) -> tuple[float, float, float, float] | None:
     """Validate and normalise a visible-page crop in [0, 1] coordinates."""
 
@@ -242,6 +303,7 @@ def render_pdf_pages(
     entries: list[dict[str, Any]] = []
     try:
         total_pages = len(document)
+        printed_labels = _printed_page_labels(document)
         for index in range(total_pages):
             page = document.load_page(index)
             image_id = f"page-{index + 1:03d}"
@@ -255,7 +317,7 @@ def render_pdf_pages(
                     "id": image_id,
                     "image_id": image_id,
                     "pdf_page": index + 1,
-                    "printed_page": None,
+                    "printed_page": printed_labels[index] if index < len(printed_labels) else None,
                     "path": image_path.relative_to(page_root.parent).as_posix(),
                     "image_path": image_path.relative_to(page_root.parent).as_posix(),
                     "width": width,
@@ -265,7 +327,11 @@ def render_pdf_pages(
                     "page_width": float(rect.width),
                     "page_height": float(rect.height),
                     "rotation": int(getattr(page, "rotation", 0) or 0),
-                    "dpi": float(dpi),
+                    # Record the DPI actually used: ``max_pixels`` can lower it,
+                    # and a manifest that reports the requested value would
+                    # misdescribe the image on disk.
+                    "dpi": _effective_dpi(width, rect.width),
+                    "requested_dpi": float(dpi),
                     "image_format": fmt,
                     "max_pixels": max_pixels,
                 }
@@ -274,7 +340,33 @@ def render_pdf_pages(
         close = getattr(document, "close", None)
         if close is not None:
             close()
+    _prune_stale_pages(page_root, {entry["id"] for entry in entries}, suffix)
     return entries
+
+
+def _effective_dpi(pixels: int, points: float) -> float:
+    """Convert a rendered width back into the DPI it was produced at."""
+
+    if not points or points <= 0:
+        return 0.0
+    return round(float(pixels) * 72.0 / float(points), 2)
+
+
+def _prune_stale_pages(page_root: Path, keep: set[str], suffix: str) -> None:
+    """Drop page images left over from an earlier, longer PDF.
+
+    A manifest that says five pages must not sit next to ten images, or a later
+    reader can link a page the current PDF no longer contains.
+    """
+
+    keep_names = {f"{image_id}{suffix}" for image_id in keep}
+    for pattern in ("page-*.png", "page-*.jpg"):
+        for stale in page_root.glob(pattern):
+            if stale.name not in keep_names:
+                try:
+                    stale.unlink()
+                except OSError:  # pragma: no cover - best effort cleanup
+                    pass
 
 
 def extract_text_with_pages(
@@ -362,6 +454,10 @@ def render_crop(
         )
         width, height = _save_pixmap(pixmap, target, fmt)
         rect = _page_rect(page)
+        if normalised is None:
+            crop_width_points = float(rect.width)
+        else:
+            crop_width_points = float(rect.width) * (normalised[2] - normalised[0])
         return {
             "id": target.stem,
             "image_id": target.stem,
@@ -376,7 +472,8 @@ def render_crop(
             "page_width": float(rect.width),
             "page_height": float(rect.height),
             "rotation": int(getattr(page, "rotation", 0) or 0),
-            "dpi": float(dpi),
+            "dpi": _effective_dpi(width, crop_width_points),
+            "requested_dpi": float(dpi),
             "image_format": fmt,
             "max_pixels": max_pixels,
         }
