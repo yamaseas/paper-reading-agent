@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paper-reading-agent.local/schemas/report.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "paper_id", "title", "short_summary", "problem",
+    "related_work", "method", "experiments", "authors_limitations",
+    "reader_analysis", "full_summary", "claims", "evidence",
+    "visual_requests", "unresolved_items"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "paper_id": {"type": "string"},
+    "title": {"type": "string"},
+    "short_summary": {"type": "string"},
+    "problem": {"$ref": "#/$defs/problem"},
+    "related_work": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["work", "problem", "method", "difference", "evidence_ids"], "properties": {"work": {"type": "string"}, "problem": {"type": "string"}, "method": {"type": "string"}, "difference": {"type": "string"}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}}},
+    "method": {"$ref": "#/$defs/method"},
+    "experiments": {"type": "array", "items": {"$ref": "#/$defs/experiment"}},
+    "authors_limitations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["text", "evidence_ids"], "properties": {"text": {"type": "string"}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}}},
+    "reader_analysis": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["text", "evidence_ids"], "properties": {"text": {"type": "string"}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}}},
+    "full_summary": {"type": "string"},
+    "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+    "visual_requests": {"type": "array", "items": {"$ref": "#/$defs/visual_request"}},
+    "unresolved_items": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "evidence_ids": {"type": "array", "items": {"type": "string"}},
+    "problem": {"type": "object", "additionalProperties": false, "required": ["background", "existing_limitation", "research_question", "motivation", "claimed_contributions", "evidence_ids"], "properties": {"background": {"type": "string"}, "existing_limitation": {"type": "string"}, "research_question": {"type": "string"}, "motivation": {"type": "string"}, "claimed_contributions": {"type": "array", "items": {"type": "string"}}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "method": {"type": "object", "additionalProperties": false, "required": ["applicable", "overview", "inputs", "outputs", "nodes", "edges", "steps", "implementation_details", "evidence_ids"], "properties": {"applicable": {"type": "boolean"}, "overview": {"type": "string"}, "inputs": {"type": "array", "items": {"type": "string"}}, "outputs": {"type": "array", "items": {"type": "string"}}, "nodes": {"type": "array", "items": {"$ref": "#/$defs/node"}}, "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}}, "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}}, "implementation_details": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "value", "evidence_ids"], "properties": {"name": {"type": "string"}, "value": {"type": "string"}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}}}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "node": {"type": "object", "additionalProperties": false, "required": ["id", "name", "input", "operation", "output", "evidence_ids"], "properties": {"id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"}, "name": {"type": "string"}, "input": {"type": "array", "items": {"type": "string"}}, "operation": {"type": "string"}, "output": {"type": "array", "items": {"type": "string"}}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "edge": {"type": "object", "additionalProperties": false, "required": ["from", "to", "relation", "confirmed", "evidence_ids"], "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "relation": {"type": "string"}, "confirmed": {"type": "boolean"}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "step": {"type": "object", "additionalProperties": false, "required": ["step", "input", "operation", "tool_or_model", "output", "why_needed", "evidence_ids"], "properties": {"step": {"type": "string"}, "input": {"type": "string"}, "operation": {"type": "string"}, "tool_or_model": {"type": "string"}, "output": {"type": "string"}, "why_needed": {"type": "string"}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "experiment": {"type": "object", "additionalProperties": false, "required": ["research_question", "dataset", "sample_size", "baselines", "models", "metrics", "settings", "main_results", "evidence_ids"], "properties": {"research_question": {"type": "string"}, "dataset": {"type": "string"}, "sample_size": {"type": "string"}, "baselines": {"type": "array", "items": {"type": "string"}}, "models": {"type": "array", "items": {"type": "string"}}, "metrics": {"type": "array", "items": {"type": "string"}}, "settings": {"type": "string"}, "main_results": {"type": "array", "items": {"type": "string"}}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "claim": {"type": "object", "additionalProperties": false, "required": ["id", "text", "kind", "evidence_ids"], "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "kind": {"type": "string", "enum": ["author_claim", "reader_inference", "llm_analysis"]}, "evidence_ids": {"$ref": "#/$defs/evidence_ids"}}},
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["id", "pdf_page", "section", "figure_or_table", "locator", "quote", "image_id"], "properties": {"id": {"type": "string"}, "pdf_page": {"type": "integer", "minimum": 1}, "section": {"type": "string"}, "figure_or_table": {"type": "string"}, "locator": {"type": "string"}, "quote": {"type": "string"}, "image_id": {"type": "string"}}},
+    "visual_request": {"type": "object", "additionalProperties": false, "required": ["pdf_page", "reason", "crop"], "properties": {"pdf_page": {"type": "integer", "minimum": 1}, "reason": {"type": "string"}, "crop": {"type": ["object", "null"], "additionalProperties": false, "required": ["x0", "y0", "x1", "y1"], "properties": {"x0": {"type": "number", "minimum": 0, "maximum": 1}, "y0": {"type": "number", "minimum": 0, "maximum": 1}, "x1": {"type": "number", "minimum": 0, "maximum": 1}, "y1": {"type": "number", "minimum": 0, "maximum": 1}}}}}
+  }
+}

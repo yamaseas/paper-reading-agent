@@ -1,0 +1,11 @@
+__pycache__/
+git-data/
+*.py[cod]
+.pytest_cache/
+.venv/
+inbox/
+workspace/
+output/
+calibration/results/
+*.log
+*.jsonl

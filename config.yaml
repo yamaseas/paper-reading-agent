@@ -1,0 +1,38 @@
+model:
+  name: qwen3.8-flash
+  base_url_env: DASHSCOPE_BASE_URL
+  api_key_env: DASHSCOPE_API_KEY
+  default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  thinking: true
+  response_mode: json_object
+  request_timeout_s: 600
+
+input:
+  mode: full_page_images
+  include_all_pdf_pages: true
+  render_dpi: 160
+  image_format: png
+  image_max_pixels: 2621440
+  extract_text: false
+  on_input_over_limit: fail_with_reason
+
+refinement:
+  max_visual_rounds: 1
+  max_crop_images: 4
+  crop_dpi: 300
+  max_format_repairs: 1
+
+batch:
+  concurrency: 2
+  max_retries_per_call: 2
+  max_requests_per_paper: 6
+  resume: true
+
+verification:
+  automated_verifier: false
+
+output:
+  language: zh-CN
+  include_method_steps: true
+  include_mermaid: true
+  include_evidence_index: true
