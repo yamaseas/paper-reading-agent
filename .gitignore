@@ -4,9 +4,14 @@ git-data/
 .pytest_cache/
 .venv/
 .env
+.env.*
+!.env.example
 inbox/
 workspace/
 output/
+history/
 calibration/results/
 *.log
 *.jsonl
+*.pdf
+.DS_Store
